@@ -72,6 +72,19 @@ The design doc writes `.policy(FailAtEnd)`. `pekaren::prelude` re-exports
 `FailurePolicy::*` so that line compiles as written, while the enum is still
 namespaced for anyone who prefers `FailurePolicy::FailAtEnd`.
 
+### There is one default store, and one definition of where it is
+
+`Queue::open_default()` opens `$PEKAREN_STORE`, or `~/.pekaren` when that is
+unset; `default_store_path()` answers the question without opening anything,
+and `pec where` prints it. A submitting script, a worker, an evaluator
+spawned an hour later and the CLI all land in the same place without having
+agreed on a path first — which matters because the processes that share a
+store here never talk to each other.
+
+Resolution happens per call rather than once at startup, so a script that
+sets the variable before opening gets what it set. An explicit path always
+wins: `Queue::open(p)` never consults the environment.
+
 ### The worker is a loop, not a service
 
 `Worker::new(&queue).run_until_idle()` is something any process enters,

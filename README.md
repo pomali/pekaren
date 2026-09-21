@@ -36,7 +36,7 @@ than a plausible-looking wrong answer. See [`docs/roadmap.md`](docs/roadmap.md).
 ```rust
 use pekaren::prelude::*;
 
-let q = Queue::open("~/.pekaren")?;
+let q = Queue::open_default()?;   // $PEKAREN_STORE, else ~/.pekaren
 
 let runs: Vec<JobId> = lrs.iter().map(|lr| {
     q.submit(Job::cmd(format!("python train.py --lr {lr}"))

@@ -10,7 +10,7 @@ use pekaren::prelude::*;
 fn main() -> Result<()> {
     let q = Queue::options()
         .grace(std::time::Duration::from_secs(8))
-        .open(std::env::var("PEKAREN_STORE").unwrap_or_else(|_| "~/.pekaren".into()))?;
+        .open_default()?;
 
     let runs: Vec<JobId> = [1e-3, 3e-4, 1e-4]
         .iter()

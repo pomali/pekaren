@@ -149,6 +149,11 @@ impl QueueOptions {
     pub fn open(self, path: impl AsRef<Path>) -> Result<Queue> {
         Queue::open_with(path, self)
     }
+
+    /// Open the default store with these options.
+    pub fn open_default(self) -> Result<Queue> {
+        Queue::open_with(default_store_path(), self)
+    }
 }
 
 /// A handle on a store directory.
@@ -166,6 +171,16 @@ impl Queue {
     /// expanded, since this path is usually typed by an agent into a script.
     pub fn open(path: impl AsRef<Path>) -> Result<Queue> {
         Queue::open_with(path, QueueOptions::default())
+    }
+
+    /// Open the default store: `$PEKAREN_STORE` if it is set, else
+    /// `~/.pekaren`.
+    ///
+    /// This is what a submitting script, a worker and `pec` all reach for
+    /// when nobody said otherwise, so they land in the same place without
+    /// agreeing on a path first. See [`default_store_path`].
+    pub fn open_default() -> Result<Queue> {
+        Queue::open(default_store_path())
     }
 
     /// Start from non-default options: `Queue::options().grace(...).open(p)`.
@@ -256,6 +271,19 @@ impl Queue {
     /// call it as they start.
     pub fn reap(&self) -> Result<ReapReport> {
         Err(Error::NotImplemented("Queue::reap"))
+    }
+}
+
+/// Where the default store lives: `$PEKAREN_STORE` when set, otherwise
+/// `~/.pekaren`. Resolved on every call, so a script that sets the variable
+/// before opening gets what it set.
+///
+/// One definition, because a store nobody can find is the same as no store:
+/// every caller that has no path of its own asks here.
+pub fn default_store_path() -> PathBuf {
+    match std::env::var_os("PEKAREN_STORE") {
+        Some(dir) if !dir.is_empty() => expand_tilde(Path::new(&dir)),
+        _ => expand_tilde(Path::new("~/.pekaren")),
     }
 }
 
