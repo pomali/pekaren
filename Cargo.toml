@@ -1,0 +1,21 @@
+[package]
+name = "pekaren"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Daemon-free job queue for long-running agent work, backed by SQLite"
+license = "MIT"
+repository = "https://github.com/pomali/pekaren"
+keywords = ["queue", "jobs", "sqlite", "dag", "agents"]
+categories = ["concurrency", "command-line-utilities"]
+
+[[bin]]
+name = "pec"
+path = "src/bin/pec.rs"
+
+[dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+thiserror = "2.0.20"
+
+[dev-dependencies]
+tempfile = "3"
