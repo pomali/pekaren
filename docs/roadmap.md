@@ -25,6 +25,9 @@ Execution entry points exist and return `Error::NotImplemented`.
 - The notification claim: finishing workers race, one wins, an unfulfilled
   claim is picked up by the next process to touch the store.
 - Spawning the stored wake command, `ByWarmth` included.
+- A `sessions` table and a `SessionStart` hook, so a wake can reach the
+  session that submitted the work: see
+  [`notes/waking-claude-code.md`](notes/waking-claude-code.md).
 
 ## 4 — Reaping and stuck jobs
 
@@ -49,4 +52,6 @@ Execution entry points exist and return `Error::NotImplemented`.
   threshold, and needs scheduling to exist first.
 - Multi-node: WAL does not work over network filesystems, so this means a
   tiny optional server, not a shared mount.
-- Cache-warm detection: today `ByWarmth` is a wall-clock deadline.
+- Cache-warm detection: today `ByWarmth` is a wall-clock deadline. The
+  replacement is socket liveness plus elapsed time, not a cache query —
+  there is no cache query.

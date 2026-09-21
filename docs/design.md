@@ -194,5 +194,7 @@ same samples feed the stall detection above.
   tiny optional server later.
 - **Starvation threshold.** How long a job waits before it reserves capacity.
 - **Cache-warm detection.** How the wake-up policy learns whether the
-  original agent's prompt cache is still warm.
+  original agent's prompt cache is still warm. Nothing exposes cache state,
+  so this becomes a liveness question instead — see
+  [`notes/waking-claude-code.md`](notes/waking-claude-code.md).
 - **Skill.** Write the agent-facing skill once the Rust API settles.
