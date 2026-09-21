@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::error::{Error, Result};
 use crate::id::JobId;
-use crate::job::{Job, Resources};
+use crate::job::{InputKind, Job, OnChange, Resources};
 use crate::profile::Profile;
 use crate::store::Store;
 
@@ -77,6 +77,8 @@ pub struct JobStatus {
     /// The `.rs` file behind a Rust job — worth handing to an evaluator
     /// along with the output, since it *is* the job.
     pub script: Option<PathBuf>,
+    /// The registered function a task job runs.
+    pub task: Option<String>,
     pub resources: Resources,
     pub submitted_at: SystemTime,
     pub started_at: Option<SystemTime>,
@@ -113,6 +115,75 @@ pub struct ReapReport {
     /// Notification claims left unfulfilled by a worker that died
     /// mid-handoff, now spawned.
     pub wakes_recovered: Vec<JobId>,
+}
+
+/// A path that is not what it was when the job was submitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Drift {
+    pub path: PathBuf,
+    pub kind: InputKind,
+    pub on_change: OnChange,
+    pub detail: DriftKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriftKind {
+    /// Same path, different content.
+    Changed,
+    /// It was there at submit time and is gone now.
+    Missing,
+    /// It was absent at submit time and exists now.
+    Appeared,
+}
+
+impl Drift {
+    /// Whether this should stop the job rather than annotate it.
+    pub fn is_fatal(&self) -> bool {
+        self.on_change == OnChange::Fail
+    }
+
+    fn describe(&self) -> String {
+        let what = match self.detail {
+            DriftKind::Changed => "changed",
+            DriftKind::Missing => "is missing",
+            DriftKind::Appeared => "appeared",
+        };
+        format!(
+            "{} {} {} since submit",
+            match self.kind {
+                InputKind::Binary => "binary",
+                InputKind::Script => "script",
+                InputKind::Param => "input",
+            },
+            self.path.display(),
+            what
+        )
+    }
+}
+
+/// Something worth telling whoever reads the job later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Event {
+    pub at: SystemTime,
+    pub level: Level,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    Info,
+    Warn,
+    Error,
+}
+
+impl Level {
+    fn from_db(s: &str) -> Level {
+        match s {
+            "error" => Level::Error,
+            "info" => Level::Info,
+            _ => Level::Warn,
+        }
+    }
 }
 
 /// How a process opens the store.
@@ -239,6 +310,68 @@ impl Queue {
 
     pub fn list(&self, filter: Filter) -> Result<Vec<JobStatus>> {
         self.store.list(filter)
+    }
+
+    /// The arguments a task job was submitted with. A running task reads
+    /// them through [`JobCtx::args`](crate::JobCtx::args) instead.
+    pub fn task_args(&self, id: JobId) -> Result<Vec<String>> {
+        self.store.task_args(id)
+    }
+
+    /// Re-hash everything the job declared and report what moved.
+    ///
+    /// A worker calls this before running a job: fatal drift — by default
+    /// the binary or script the job runs — fails it rather than running
+    /// code the submitter never saw, and the rest is recorded as a warning
+    /// that travels with the result. Anything found is written to the job's
+    /// events, whatever the caller does with the return value.
+    pub fn check_inputs(&self, id: JobId) -> Result<Vec<Drift>> {
+        let mut drifted = Vec::new();
+        for input in self.store.inputs(id)? {
+            let meta = std::fs::metadata(&input.path).ok();
+            let now = match &meta {
+                Some(_) => Some(crate::hash::path_hash(&input.path)?),
+                None => None,
+            };
+            // A file where a directory was is a change even if the hashes
+            // somehow agree.
+            let swapped = meta.map(|m| m.is_dir() != input.is_dir).unwrap_or(false);
+            let detail = match (&input.hash, &now) {
+                (Some(before), Some(after)) if before == after && !swapped => continue,
+                (Some(_), Some(_)) => DriftKind::Changed,
+                (Some(_), None) => DriftKind::Missing,
+                (None, Some(_)) => DriftKind::Appeared,
+                (None, None) => continue,
+            };
+            let drift = Drift {
+                path: input.path,
+                kind: input.kind,
+                on_change: input.on_change,
+                detail,
+            };
+            if drift.on_change != OnChange::Ignore {
+                let level = if drift.is_fatal() { "error" } else { "warn" };
+                self.store.record_event(id, level, &drift.describe())?;
+                drifted.push(drift);
+            }
+        }
+        Ok(drifted)
+    }
+
+    /// What has been noticed about this job: inputs that moved, and later
+    /// stalls and reclaims. The wake command carries these along with the
+    /// result.
+    pub fn events(&self, id: JobId) -> Result<Vec<Event>> {
+        Ok(self
+            .store
+            .events(id)?
+            .into_iter()
+            .map(|(at, level, message)| Event {
+                at: crate::store::from_ms(at),
+                level: Level::from_db(&level),
+                message,
+            })
+            .collect())
     }
 
     /// Ids whose dependencies have all settled successfully — what a worker

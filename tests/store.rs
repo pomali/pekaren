@@ -117,7 +117,7 @@ fn opens_a_store_written_by_an_older_schema() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("store.db");
 
-    // Build a v1 store by hand: the v2 column did not exist yet.
+    // Build a v1 store by hand: strip everything v2 and v3 added.
     {
         let q = Queue::options()
             .work_on_submit(false)
@@ -127,18 +127,28 @@ fn opens_a_store_written_by_an_older_schema() {
     }
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch("ALTER TABLE jobs DROP COLUMN script_path; PRAGMA user_version = 1;")
-            .unwrap();
+        conn.execute_batch(
+            "ALTER TABLE jobs DROP COLUMN script_path;
+             ALTER TABLE jobs DROP COLUMN task_name;
+             DROP TABLE task_args;
+             DROP TABLE job_inputs;
+             DROP TABLE job_events;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
     }
 
-    // Reopening migrates it forward, old rows intact.
+    // Reopening runs both migrations in order, old rows intact.
     let q = Queue::options()
         .work_on_submit(false)
         .open(dir.path())
         .unwrap();
     assert_eq!(q.list(Filter::All).unwrap().len(), 1);
     let id = q.submit(Job::rust("fn main() {}")).unwrap();
-    assert!(q.status(id).unwrap().script.is_some());
+    assert!(q.status(id).unwrap().script.is_some(), "v2 column works");
+    // v3: the script is a watched input, hashed at submit.
+    assert!(q.check_inputs(id).unwrap().is_empty());
+    assert!(q.events(id).unwrap().is_empty());
 
     let conn = rusqlite::Connection::open(&db).unwrap();
     let version: i32 = conn

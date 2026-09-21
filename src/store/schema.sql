@@ -1,4 +1,4 @@
--- pekaren store, schema v2.
+-- pekaren store, schema v3.
 --
 -- Every process that opens this file is a client and potentially a worker;
 -- there is no daemon and no single writer. Three rules follow from that and
@@ -30,6 +30,9 @@ CREATE TABLE jobs (
   -- The .rs file behind a Rust job: content-addressed under <store>/scripts
   -- for inline source, or the caller's own path. NULL for everything else.
   script_path    TEXT,
+  -- The registered function a task job runs, inside the binary named by
+  -- `program`. NULL for everything else.
+  task_name      TEXT,
 
   -- Declaration: admission control, and the baseline for the actual run.
   cpus           INTEGER NOT NULL DEFAULT 1,
@@ -181,6 +184,46 @@ CREATE TABLE hosts (
   gpu_devices TEXT NOT NULL DEFAULT '',  -- comma-separated device indices
   seen_at     INTEGER NOT NULL
 ) WITHOUT ROWID;
+
+-- Arguments for a task job. Separate from job_args, which is argv: a task
+-- takes these through its JobCtx, and the binary's own argv stays empty so
+-- a program with its own CLI is never handed flags it did not expect.
+CREATE TABLE task_args (
+  job_id INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+  pos    INTEGER NOT NULL,
+  arg    TEXT NOT NULL,
+  PRIMARY KEY (job_id, pos)
+) WITHOUT ROWID;
+
+-- Paths whose content the job assumed when it was submitted: the binary a
+-- task re-runs, the .rs file a Rust job compiles, and whatever the
+-- submitter declared with `watch`. Hashed at submit, re-hashed before the
+-- job runs. `hash` is NULL when the path was absent at submit time, which
+-- is itself a state worth comparing against.
+CREATE TABLE job_inputs (
+  job_id      INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+  pos         INTEGER NOT NULL,
+  kind        TEXT NOT NULL CHECK (kind IN ('binary', 'script', 'param')),
+  path        TEXT NOT NULL,
+  is_dir      INTEGER NOT NULL DEFAULT 0,
+  hash        TEXT,
+  recorded_at INTEGER NOT NULL,
+  on_change   TEXT NOT NULL CHECK (on_change IN ('fail', 'warn', 'ignore')),
+  PRIMARY KEY (job_id, pos)
+) WITHOUT ROWID;
+
+-- Anything worth telling whoever reads the job later: an input that moved,
+-- a stall, a reclaim. The wake command carries these along with the result,
+-- which is the whole point of noticing.
+CREATE TABLE job_events (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id  INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+  at      INTEGER NOT NULL,
+  level   TEXT NOT NULL CHECK (level IN ('info', 'warn', 'error')),
+  message TEXT NOT NULL
+);
+
+CREATE INDEX job_events_by_job ON job_events (job_id, at);
 
 -- A job is runnable when every parent has settled successfully. Kept as a
 -- view so the ready set has exactly one definition.

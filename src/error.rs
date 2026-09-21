@@ -56,6 +56,21 @@ pub enum Error {
     #[error("timed out waiting for {0} job(s)")]
     WaitTimeout(usize),
 
+    /// This process was started to run a task the binary does not
+    /// register. Almost always a binary older or newer than the one that
+    /// submitted the job.
+    #[error("this binary does not register a task called {0:?}")]
+    UnknownTask(String),
+
+    /// A task asked for its context outside a job process.
+    #[error("not running as a job: {0} is not set")]
+    NotAJobProcess(&'static str),
+
+    /// A path the job depends on is not what it was at submit time, and the
+    /// job said that should stop it.
+    #[error("job {id} depends on {path}, which changed since it was submitted")]
+    InputChanged { id: JobId, path: std::path::PathBuf },
+
     /// Declared in milestone 1, implemented in milestone 2.
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),

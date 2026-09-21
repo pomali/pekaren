@@ -39,22 +39,27 @@
 //! [`Error::NotImplemented`] rather than pretending to work.
 
 mod error;
+mod hash;
 mod id;
 mod job;
 mod profile;
 mod queue;
 mod store;
+mod task;
 mod worker;
 
 pub use error::{Error, Result};
 pub use id::JobId;
 pub use job::{
-    Command, FailurePolicy, Job, JobKind, KillAfter, Resources, RustScript, RustSource, Wake,
+    Command, FailurePolicy, InputKind, Job, JobKind, KillAfter, OnChange, Resources, RustScript,
+    RustSource, Wake, WatchedPath,
 };
 pub use profile::{Profile, Sample};
 pub use queue::{
-    Filter, JobStatus, Logs, Queue, QueueOptions, ReapReport, State, default_store_path,
+    Drift, DriftKind, Event, Filter, JobStatus, Level, Logs, Queue, QueueOptions, ReapReport,
+    State, default_store_path,
 };
+pub use task::{JobCtx, Task, TaskFn, TaskResult, Tasks};
 pub use worker::{Capacity, Worker, WorkerReport};
 
 /// Everything a submitting script needs, including the bare
@@ -62,11 +67,11 @@ pub use worker::{Capacity, Worker, WorkerReport};
 pub mod prelude {
     pub use crate::FailurePolicy::*;
     pub use crate::{
-        Command, FailurePolicy, Job, JobId, JobStatus, Queue, Resources, Result, State, Wake,
-        default_store_path,
+        Command, Drift, FailurePolicy, Job, JobCtx, JobId, JobStatus, OnChange, Queue, Resources,
+        Result, State, Task, TaskResult, Tasks, Wake, default_store_path,
     };
 }
 
 /// Schema version this build speaks. A store written by a newer build is
 /// refused rather than migrated backwards.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;

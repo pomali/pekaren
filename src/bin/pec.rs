@@ -18,6 +18,7 @@ pec — pekáreň's oven
 usage:
     pec [--store <dir>] status [<job-id>]
     pec [--store <dir>] runnable
+    pec [--store <dir>] check [<job-id>]
     pec [--store <dir>] where
 
 the store defaults to $PEKAREN_STORE, else ~/.pekaren.
@@ -59,17 +60,39 @@ fn run() -> Result<()> {
         "status" => {
             let q = open()?;
             match args.next() {
-                Some(id) => {
-                    let id: JobId = id
-                        .parse()
-                        .map_err(|_| pekaren::Error::NotImplemented("job id must look like j42"))?;
-                    print_status(&q.status(id)?);
-                }
+                Some(id) => print_status(&q.status(parse_id(&id)?)?),
                 None => {
                     for s in q.list(Filter::All)? {
                         print_status(&s);
                     }
                 }
+            }
+        }
+        // Re-hash what each job depends on and say what moved. A worker
+        // does this before running anything; this is the same check by
+        // hand, for a store you are about to trust.
+        "check" => {
+            let q = open()?;
+            let ids = match args.next() {
+                Some(id) => vec![parse_id(&id)?],
+                None => q
+                    .list(Filter::Unsettled)?
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect(),
+            };
+            let mut fatal = 0;
+            for id in ids {
+                for drift in q.check_inputs(id)? {
+                    let mark = if drift.is_fatal() { "FAIL" } else { "warn" };
+                    println!("{id} {mark} {:?} {}", drift.detail, drift.path.display());
+                    fatal += u32::from(drift.is_fatal());
+                }
+            }
+            if fatal > 0 {
+                return Err(pekaren::Error::NotImplemented(
+                    "jobs above depend on code that changed; they fail when claimed",
+                ));
             }
         }
         "runnable" => {
@@ -88,14 +111,31 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+fn parse_id(raw: &str) -> Result<JobId> {
+    raw.parse()
+        .map_err(|_| pekaren::Error::NotImplemented("job id must look like j42"))
+}
+
 fn print_status(s: &JobStatus) {
-    let what = if s.is_barrier { "barrier" } else { "job" };
-    let name = s.name.clone().unwrap_or_default();
+    let what = if s.is_barrier {
+        "barrier"
+    } else if s.task.is_some() {
+        "task"
+    } else if s.script.is_some() {
+        "rust"
+    } else {
+        "job"
+    };
+    let name = s
+        .name
+        .clone()
+        .or_else(|| s.task.clone())
+        .unwrap_or_default();
+    let flag = if s.stalled { " (stalled)" } else { "" };
     println!(
-        "{:<6} {:<8} {:<9} {}",
+        "{:<6} {:<8} {:<9} {name}{flag}",
         s.id.to_string(),
         what,
-        s.state,
-        name
+        s.state
     );
 }

@@ -45,6 +45,68 @@ in a terminal. `Job::exec("python", ["train.py", "--lr", "3e-4"])` execs
 directly with no shell, for anything built from untrusted or awkward values.
 Both produce the same `Command`; only the `shell` flag differs.
 
+### A job that is a function: tasks, and why not a closure
+
+`Job::task(handle)` runs a function registered in the submitting binary.
+The obvious API — hand `submit` a closure — cannot exist: a job outlives
+the process that submitted it, so the store can only hold a pointer to
+code on disk. The choice is which pointer.
+
+| Pointer | What it costs |
+| --- | --- |
+| Inline source (`Job::rust`) | No type checking, no tooling, compiled at claim time |
+| A `.rs` path (`Job::rust_file`) | Real file, still compiled at claim time, still outside the program that submitted it |
+| **This binary + a name** (`Job::task`) | Ordinary compiled Rust, checked when you queue the job; needs the binary to still be there when it runs |
+
+The third is the default answer, and the first two remain for code with no
+binary to live in — a script an agent wrote on the spot.
+
+Registration returns a `Task` handle rather than taking a bare string at
+the submit site:
+
+```rust
+let train = tasks.add("train", train);   // handle
+q.submit(Job::task(train).arg("3e-4"))?; // not Job::task("trian")
+```
+
+so an unregistered task cannot be submitted and a rename is a compile
+error. The name still exists — the store needs one — but it is written
+once, next to the function it names.
+
+Dispatch goes through the environment (`PEKAREN_TASK`, `PEKAREN_JOB`), not
+argv, and the task's own arguments come from the store through `JobCtx`.
+A binary with its own CLI is therefore never handed flags it did not
+expect, which it would reject.
+
+`bootstrap()` exits the process after running a task. The alternative,
+returning and letting `main` continue, would re-run the submitting code
+inside every job.
+
+### What a job assumed: hashes, not hope
+
+Every path a job depends on is hashed at submit time and re-hashed before
+it runs: the binary behind a task, the script behind a Rust job, and
+anything the submitter declares with `watch`. They are one table and one
+check, differing only in policy — code defaults to `OnChange::Fail`,
+declared inputs to `OnChange::Warn`.
+
+Failing on a changed binary is the interesting default. The cheap
+alternative, running whatever is at the path now, silently judges new code
+against an evaluation prompt written for the old code. The other
+alternative, freezing a copy of the binary into the store at submit time,
+is reproducible but hides the same problem behind a stale snapshot; it is
+worth adding later as an opt-in, not as the default.
+
+Directories are hashed by the shape of the tree — each entry's relative
+path, length and mtime — rather than by content, so declaring a dataset
+costs one `stat` per file instead of a full read. The tradeoff is that
+`touch` alone looks like a change, which is why a directory warns rather
+than fails.
+
+Hashes are non-cryptographic. They answer "is this the same thing I
+submitted?" for a store only its owner writes; they are not a defence
+against someone who can rewrite the store, and the code says so.
+
 ### Rust source is a job kind, not a command the caller assembles
 
 `Job::rust("fn main() { .. }")` takes source; `Job::rust_file(p)` takes a

@@ -51,27 +51,63 @@ q.submit(Job::barrier()
     .on_done("pec-evaluate --sweep lr"))?;
 ```
 
-A job can also *be* Rust, with no file to manage:
+A job can also *be* a function in your own program:
 
 ```rust
-q.submit(Job::rust(r#"
-    fn main() {
-        println!("sum={}", (1..=10).sum::<u32>());
-    }
-"#).rust_manifest("[dependencies]\nserde_json = \"1\""))?;
+fn train(ctx: &JobCtx) -> TaskResult {
+    println!("training with lr={}", ctx.arg(0).ok_or("no lr")?);
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let mut tasks = Tasks::new();
+    let train = tasks.add("train", train);
+    tasks.bootstrap()?;              // a worker running this binary stops here
+
+    let q = Queue::open_default()?;
+    q.submit(Job::task(train).arg("3e-4").gpus(1).watch("data/train"))?;
+    Ok(())
+}
 ```
 
-The source is written into the store at submit time, content-addressed, and
-run as a single-file script — `cargo -Zscript` by default, which needs a
-nightly toolchain, or whatever `PEKAREN_RUST_RUNNER` names. `Job::rust_file`
-runs an existing `.rs` where it lies. The path lands in `JobStatus::script`,
-so an evaluator can read the code that produced the output.
+A job has to outlive the process that submitted it, so the store can only
+hold a *pointer* to code on disk, never a closure. A task is the narrowest
+such pointer — this binary, this registered name — and the body stays
+ordinary compiled Rust. `tasks.add` hands back a handle, so `Job::task`
+cannot name a task nothing registers, and a rename is a compile error rather
+than a failure an hour later. A worker runs the job by re-executing the
+binary with `PEKAREN_TASK` set; `bootstrap` dispatches and exits before the
+submitting code runs again.
+
+For code that has no binary to live in — something an agent generated on the
+spot — `Job::rust_file("analyze.rs")` runs a `.rs` file as a single-file
+script, and `Job::rust("fn main() { … }")` takes the source directly and
+writes it into the store. Both use `cargo -Zscript` by default, which needs
+a nightly toolchain, or whatever `PEKAREN_RUST_RUNNER` names.
 
 Rust is the scripting surface at both levels: an agent writes one `.rs` file
 with an inline dependency manifest (cargo's single-file script support), so
 there is no project scaffolding. Loops and fan-outs are ordinary code — collect the
 handles into a `Vec`, then submit one barrier that depends on all of them.
 See [`examples/sweep.rs`](examples/sweep.rs).
+
+## What a job assumed
+
+A job submitted now may run in an hour, by which time the code and the data
+it named can have moved. Every path a job depends on is hashed at submit
+time — the binary behind a task, the `.rs` behind a script, and anything
+declared with `watch` — and re-hashed before it runs:
+
+| What moved | Default | Why |
+| --- | --- | --- |
+| The binary or script the job runs | **Fail** | A rebuilt binary is different code; running it under an hour-old evaluation prompt is worse than not running it |
+| A declared input (`watch`) | **Warn** | A dataset that grew is usually fine, and always worth knowing about |
+
+Override either with `.on_code_change(OnChange::Warn)` or
+`.watch_as(path, OnChange::Fail)`. Files are hashed by content, directories
+by the shape of the tree — each entry's relative path, length and mtime — so
+a dataset is not read end to end. Findings land in the job's events and
+travel with the result; `pec check` runs the same check by hand.
 
 ## Build
 
@@ -88,6 +124,8 @@ beyond a C compiler.
 | Path | What |
 | --- | --- |
 | `src/job.rs` | `Job` builder, `Command`, `Resources`, `Wake`, policies |
+| `src/task.rs` | tasks: jobs that are functions in the submitting binary |
+| `src/hash.rs` | change detection for the paths a job depends on |
 | `src/queue.rs` | `Queue`, `JobStatus`, `State`, submit and read paths |
 | `src/store/` | SQLite: schema, migrations, conditional writes |
 | `src/worker.rs` | claim / supervise / commit loop (milestone 2) |

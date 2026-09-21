@@ -12,6 +12,10 @@ Execution entry points exist and return `Error::NotImplemented`.
 
 - Claim: pick a runnable job whose declaration fits the free pool, write a
   lease with a token and an expiry, all in one `BEGIN IMMEDIATE`.
+- Before running anything, `check_inputs`: fatal drift fails the job with
+  what moved, the rest is recorded and travels with the result.
+- Set `PEKAREN_JOB` and `PEKAREN_STORE` on the child so a task can reach
+  its own context.
 - Supervise: spawn the child, record PID + process start time, renew the
   lease, enforce the wall-clock cap.
 - Commit: write `done`/`failed` only `WHERE lease_token` is still ours, then
@@ -47,6 +51,11 @@ Execution entry points exist and return `Error::NotImplemented`.
 - The agent-facing skill, once the Rust API has settled.
 
 ## Parked
+
+- Freezing the binary: hard-link or copy a task's executable into the store
+  at submit time, so a queued job can run the code it was submitted with
+  instead of failing when the binary is rebuilt. Opt-in, once failing
+  proves too strict.
 
 - Starvation: a waiting job reserves capacity past some threshold. Needs the
   threshold, and needs scheduling to exist first.

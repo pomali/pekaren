@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::id::JobId;
+use crate::task::Task;
 
 /// A command to run. The library stores it and executes it; it never parses
 /// or rewrites it.
@@ -138,6 +139,9 @@ pub enum JobKind {
     Command(Command),
     /// Rust source, run as a single-file script.
     Rust(RustScript),
+    /// A function registered in the submitting binary, run by re-executing
+    /// that binary. See [`crate::task`].
+    Task(Task),
     /// A node with no command of its own that fires when its dependencies
     /// settle. Notification hangs off barriers, not leaves, so an expensive
     /// context is pinged once per subgraph rather than once per job.
@@ -194,6 +198,78 @@ impl From<String> for Wake {
     fn from(line: String) -> Self {
         Wake::Always(Command::line(line))
     }
+}
+
+/// What to do when a path a job depends on is not what it was at submit
+/// time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnChange {
+    /// Fail the job without running it, and say what changed. The default
+    /// for the code a job runs: a binary that has been rebuilt is different
+    /// code, and running it under an hour-old evaluation prompt is worse
+    /// than not running it.
+    Fail,
+    /// Run anyway and record a warning on the job, which travels with the
+    /// result. The default for declared inputs: a dataset that grew is
+    /// usually fine and always worth knowing about.
+    Warn,
+    /// Say nothing.
+    Ignore,
+}
+
+impl OnChange {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            OnChange::Fail => "fail",
+            OnChange::Warn => "warn",
+            OnChange::Ignore => "ignore",
+        }
+    }
+
+    pub(crate) fn from_db(s: &str) -> OnChange {
+        match s {
+            "fail" => OnChange::Fail,
+            "ignore" => OnChange::Ignore,
+            _ => OnChange::Warn,
+        }
+    }
+}
+
+/// Which part of a job a watched path is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputKind {
+    /// The executable a task job re-runs.
+    Binary,
+    /// The `.rs` file a Rust job compiles.
+    Script,
+    /// Something the submitter declared: a dataset, a config, a checkpoint.
+    Param,
+}
+
+impl InputKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            InputKind::Binary => "binary",
+            InputKind::Script => "script",
+            InputKind::Param => "param",
+        }
+    }
+
+    pub(crate) fn from_db(s: &str) -> InputKind {
+        match s {
+            "binary" => InputKind::Binary,
+            "script" => InputKind::Script,
+            _ => InputKind::Param,
+        }
+    }
+}
+
+/// A path whose content the job assumed when it was submitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchedPath {
+    pub path: PathBuf,
+    pub kind: InputKind,
+    pub on_change: OnChange,
 }
 
 /// What a job says it needs. Drives admission control, and doubles as the
@@ -254,6 +330,9 @@ pub struct Job {
     pub(crate) policy: FailurePolicy,
     pub(crate) wake: Wake,
     pub(crate) kill_after: KillAfter,
+    pub(crate) task_args: Vec<String>,
+    pub(crate) watched: Vec<WatchedPath>,
+    pub(crate) on_code_change: OnChange,
 }
 
 impl Job {
@@ -329,6 +408,65 @@ impl Job {
         self
     }
 
+    /// A job that runs a function registered in this binary.
+    ///
+    /// Takes the handle [`Tasks::add`](crate::Tasks::add) returned, not a
+    /// name, so a task nothing registers cannot be submitted. The store
+    /// records the binary's path and a hash of its contents; by default the
+    /// job fails rather than run a binary that has been rebuilt since.
+    pub fn task(task: Task) -> Self {
+        Job::new(JobKind::Task(task))
+    }
+
+    /// An argument for a task job. The task reads them with
+    /// [`JobCtx::args`](crate::JobCtx::args). Ignored on other kinds.
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.task_args.push(arg.into());
+        self
+    }
+
+    /// Several arguments at once.
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.task_args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Declare a path this job depends on: a dataset, a config file, a
+    /// checkpoint directory.
+    ///
+    /// Its hash is recorded at submit time and checked before the job runs.
+    /// A file is hashed by its contents; a directory by the shape of its
+    /// tree — every entry's relative path, length and modification time —
+    /// so an edit, an addition or a deletion shows up without reading a
+    /// dataset end to end. Changes warn by default; see
+    /// [`watch_as`](Job::watch_as).
+    pub fn watch(self, path: impl AsRef<Path>) -> Self {
+        self.watch_as(path, OnChange::Warn)
+    }
+
+    /// [`watch`](Job::watch) with the policy spelled out — `OnChange::Fail`
+    /// for an input the job would be meaningless without.
+    pub fn watch_as(mut self, path: impl AsRef<Path>, on_change: OnChange) -> Self {
+        self.watched.push(WatchedPath {
+            path: path.as_ref().to_path_buf(),
+            kind: InputKind::Param,
+            on_change,
+        });
+        self
+    }
+
+    /// What to do when the code itself changed: the binary behind a task
+    /// job, or the `.rs` file behind a Rust job. Defaults to
+    /// [`OnChange::Fail`].
+    pub fn on_code_change(mut self, on_change: OnChange) -> Self {
+        self.on_code_change = on_change;
+        self
+    }
+
     /// A barrier: no command, fires when its dependencies settle.
     pub fn barrier() -> Self {
         Job::new(JobKind::Barrier)
@@ -346,6 +484,9 @@ impl Job {
             policy: FailurePolicy::default(),
             wake: Wake::default(),
             kill_after: KillAfter::default(),
+            task_args: Vec::new(),
+            watched: Vec::new(),
+            on_code_change: OnChange::Fail,
         }
     }
 

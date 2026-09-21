@@ -11,7 +11,9 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::error::{Error, Result};
 use crate::id::JobId;
-use crate::job::{Command, Job, JobKind, Resources, RustSource, Wake};
+use crate::job::{
+    Command, InputKind, Job, JobKind, OnChange, Resources, RustSource, Wake, WatchedPath,
+};
 use crate::profile::Profile;
 use crate::queue::{Filter, JobStatus, State};
 
@@ -23,6 +25,33 @@ const SCHEMA: &str = include_str!("schema.sql");
 const MIGRATIONS: &[&str] = &[
     // v1 -> v2: Rust jobs remember the .rs file they run.
     "ALTER TABLE jobs ADD COLUMN script_path TEXT;",
+    // v2 -> v3: task jobs, and the paths a job depends on.
+    "ALTER TABLE jobs ADD COLUMN task_name TEXT;
+     CREATE TABLE task_args (
+       job_id INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+       pos    INTEGER NOT NULL,
+       arg    TEXT NOT NULL,
+       PRIMARY KEY (job_id, pos)
+     ) WITHOUT ROWID;
+     CREATE TABLE job_inputs (
+       job_id      INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+       pos         INTEGER NOT NULL,
+       kind        TEXT NOT NULL CHECK (kind IN ('binary', 'script', 'param')),
+       path        TEXT NOT NULL,
+       is_dir      INTEGER NOT NULL DEFAULT 0,
+       hash        TEXT,
+       recorded_at INTEGER NOT NULL,
+       on_change   TEXT NOT NULL CHECK (on_change IN ('fail', 'warn', 'ignore')),
+       PRIMARY KEY (job_id, pos)
+     ) WITHOUT ROWID;
+     CREATE TABLE job_events (
+       id      INTEGER PRIMARY KEY AUTOINCREMENT,
+       job_id  INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+       at      INTEGER NOT NULL,
+       level   TEXT NOT NULL CHECK (level IN ('info', 'warn', 'error')),
+       message TEXT NOT NULL
+     );
+     CREATE INDEX job_events_by_job ON job_events (job_id, at);",
 ];
 
 /// Unix millis, the store's one time unit.
@@ -163,11 +192,13 @@ impl Store {
             }
         }
 
-        // A Rust job is a command job once its script exists on disk; the
-        // only difference the store keeps is the path it remembers.
-        let (kind, command, script_path) = match &job.kind {
-            JobKind::Command(c) => ("command", Some(c.clone()), None),
-            JobKind::Barrier => ("barrier", None, None),
+        // Rust and task jobs are command jobs once the thing they run is
+        // located on disk; what the store keeps besides the command is the
+        // path it remembers, and the hash of what was there at submit time.
+        let mut watched: Vec<WatchedPath> = Vec::new();
+        let (kind, command, script_path, task_name) = match &job.kind {
+            JobKind::Command(c) => ("command", Some(c.clone()), None, None),
+            JobKind::Barrier => ("barrier", None, None, None),
             JobKind::Rust(script) => {
                 let path = match &script.source {
                     RustSource::File(p) => p.clone(),
@@ -176,9 +207,36 @@ impl Store {
                         self.write_script(&text)?
                     }
                 };
-                ("command", Some(Command::rust_script(&path)), Some(path))
+                watched.push(WatchedPath {
+                    path: path.clone(),
+                    kind: InputKind::Script,
+                    on_change: job.on_code_change,
+                });
+                (
+                    "command",
+                    Some(Command::rust_script(&path)),
+                    Some(path),
+                    None,
+                )
+            }
+            JobKind::Task(task) => {
+                // The job points at this binary. Its argv stays empty: the
+                // task reads its arguments through JobCtx, so a program
+                // with its own CLI is never handed flags it did not expect.
+                let exe = std::env::current_exe()
+                    .map_err(|e| Error::io(std::path::Path::new("<current exe>"), e))?;
+                watched.push(WatchedPath {
+                    path: exe.clone(),
+                    kind: InputKind::Binary,
+                    on_change: job.on_code_change,
+                });
+                let command =
+                    Command::exec(exe.to_string_lossy().into_owned(), Vec::<String>::new())
+                        .env(crate::task::TASK_ENV, task.name());
+                ("command", Some(command), None, Some(task.name()))
             }
         };
+        watched.extend(job.watched.iter().cloned());
         let command = command.as_ref();
         let state = if job.deps.is_empty() {
             State::Ready
@@ -188,11 +246,12 @@ impl Store {
 
         tx.execute(
             "INSERT INTO jobs (
-                 name, kind, shell, program, cwd, script_path,
+                 name, kind, shell, program, cwd, script_path, task_name,
                  cpus, gpus, mem_mb, est_secs, kill_after_secs,
                  eval_prompt, retries, idempotent, failure_policy,
                  state, submitted_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                       ?17, ?18)",
             params![
                 job.name,
                 kind,
@@ -204,6 +263,7 @@ impl Store {
                 script_path
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned()),
+                task_name,
                 job.resources.cpus,
                 job.resources.gpus,
                 job.resources.mem_mb as i64,
@@ -232,6 +292,40 @@ impl Store {
                     params![id.get(), key, val],
                 )?;
             }
+        }
+
+        for (pos, arg) in job.task_args.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO task_args (job_id, pos, arg) VALUES (?1, ?2, ?3)",
+                params![id.get(), pos as i64, arg],
+            )?;
+        }
+
+        // Hash every path the job depends on, now, while the submitter
+        // still knows what it meant. A path that is absent records a NULL
+        // hash: appearing later is a change too.
+        let at = now_ms();
+        for (pos, input) in watched.iter().enumerate() {
+            let meta = std::fs::metadata(&input.path).ok();
+            let hash = match &meta {
+                Some(_) => Some(crate::hash::path_hash(&input.path)?),
+                None => None,
+            };
+            tx.execute(
+                "INSERT INTO job_inputs
+                     (job_id, pos, kind, path, is_dir, hash, recorded_at, on_change)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    id.get(),
+                    pos as i64,
+                    input.kind.as_str(),
+                    input.path.to_string_lossy().into_owned(),
+                    meta.map(|m| m.is_dir() as i64).unwrap_or(0),
+                    hash,
+                    at,
+                    input.on_change.as_str(),
+                ],
+            )?;
         }
 
         for dep in &job.deps {
@@ -308,6 +402,7 @@ impl Store {
             script: row
                 .get::<_, Option<String>>("script_path")?
                 .map(PathBuf::from),
+            task: row.get("task_name")?,
             resources: Resources {
                 cpus: row.get::<_, i64>("cpus")? as u32,
                 gpus: row.get::<_, i64>("gpus")? as u32,
@@ -392,6 +487,55 @@ impl Store {
         }))
     }
 
+    /// The arguments a task job was submitted with.
+    pub(crate) fn task_args(&self, id: JobId) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT arg FROM task_args WHERE job_id = ?1 ORDER BY pos")?;
+        let args = stmt
+            .query_map([id.get()], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(args)
+    }
+
+    /// The paths a job declared, with the hash each had at submit time.
+    pub(crate) fn inputs(&self, id: JobId) -> Result<Vec<RecordedInput>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, path, is_dir, hash, on_change
+             FROM job_inputs WHERE job_id = ?1 ORDER BY pos",
+        )?;
+        let rows = stmt
+            .query_map([id.get()], |r| {
+                Ok(RecordedInput {
+                    kind: InputKind::from_db(&r.get::<_, String>(0)?),
+                    path: PathBuf::from(r.get::<_, String>(1)?),
+                    is_dir: r.get::<_, i64>(2)? != 0,
+                    hash: r.get::<_, Option<String>>(3)?,
+                    on_change: OnChange::from_db(&r.get::<_, String>(4)?),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub(crate) fn record_event(&self, id: JobId, level: &str, message: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO job_events (job_id, at, level, message) VALUES (?1, ?2, ?3, ?4)",
+            params![id.get(), now_ms(), level, message],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn events(&self, id: JobId) -> Result<Vec<(i64, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT at, level, message FROM job_events WHERE job_id = ?1 ORDER BY at, id",
+        )?;
+        let rows = stmt
+            .query_map([id.get()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Ids whose dependencies have all settled successfully, oldest first.
     /// The runnable set has exactly one definition, and it lives in the view.
     pub(crate) fn runnable(&self) -> Result<Vec<JobId>> {
@@ -440,9 +584,20 @@ fn policy_str(p: crate::job::FailurePolicy) -> &'static str {
 }
 
 const SELECT_ALL: &str = "SELECT id, name, kind, state, stalled, attempt, exit_code, failure,
-     eval_prompt, script_path, cpus, gpus, mem_mb, est_secs, submitted_at, started_at, finished_at
+     eval_prompt, script_path, task_name, cpus, gpus, mem_mb, est_secs,
+     submitted_at, started_at, finished_at
      FROM jobs";
 
 const SELECT_JOB: &str = "SELECT id, name, kind, state, stalled, attempt, exit_code, failure,
-     eval_prompt, script_path, cpus, gpus, mem_mb, est_secs, submitted_at, started_at, finished_at
+     eval_prompt, script_path, task_name, cpus, gpus, mem_mb, est_secs,
+     submitted_at, started_at, finished_at
      FROM jobs WHERE id = ?1";
+
+/// One row of `job_inputs`, as the store holds it.
+pub(crate) struct RecordedInput {
+    pub kind: InputKind,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub hash: Option<String>,
+    pub on_change: OnChange,
+}

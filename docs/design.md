@@ -41,9 +41,21 @@ whether the job is safe to re-run.
 
 **Rust as the scripting surface.** Agents write a single `.rs` file with an
 inline dependency manifest, so there is no project scaffolding. Loops and
-fan-outs are ordinary code. A job itself can be Rust source rather than a
-command line (`Job::rust`), written into the store at submit time and run as
-a single-file script.
+fan-outs are ordinary code.
+
+**A job can be a function.** `Job::task` submits a function registered in
+the submitting binary, and a worker runs it by re-executing that binary.
+The job body is compiled, checked Rust rather than a string; the store holds
+the binary's path and the registered name, because a job outlives the
+process that submitted it and a closure cannot be written to a row. Code
+with no binary to live in — something generated on the spot — goes through
+`Job::rust_file` or `Job::rust` instead and runs as a single-file script.
+
+**What a job assumed.** Every path a job depends on is hashed at submit
+time and re-hashed before it runs: the binary or script it runs, which
+fails the job if it changed, and inputs declared with `watch`, which warn.
+A rebuilt binary judged against an hour-old evaluation prompt is not the
+job that was submitted.
 
 **Grace window.** After submitting, the script stays attached for a short
 window (5–10 s). A job that dies in that window almost always failed on
