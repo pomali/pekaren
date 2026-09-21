@@ -11,11 +11,19 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::error::{Error, Result};
 use crate::id::JobId;
-use crate::job::{Command, Job, JobKind, Resources, Wake};
+use crate::job::{Command, Job, JobKind, Resources, RustSource, Wake};
 use crate::profile::Profile;
 use crate::queue::{Filter, JobStatus, State};
 
 const SCHEMA: &str = include_str!("schema.sql");
+
+/// One entry per schema version above 1, applied in order to bring an older
+/// store forward. `SCHEMA` itself is always the current shape, so a fresh
+/// store never runs a migration.
+const MIGRATIONS: &[&str] = &[
+    // v1 -> v2: Rust jobs remember the .rs file they run.
+    "ALTER TABLE jobs ADD COLUMN script_path TEXT;",
+];
 
 /// Unix millis, the store's one time unit.
 pub(crate) fn now_ms() -> i64 {
@@ -75,17 +83,25 @@ impl Store {
                 expected: crate::SCHEMA_VERSION,
             });
         }
-        if found == 0 {
-            // A fresh store. Under WAL two processes can reach here at once,
-            // so take the write lock first and re-check.
-            let tx = self.write_tx()?;
-            let found: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-            if found == 0 {
-                tx.execute_batch(SCHEMA)?;
-                tx.pragma_update(None, "user_version", crate::SCHEMA_VERSION)?;
-            }
-            tx.commit()?;
+        if found == crate::SCHEMA_VERSION {
+            return Ok(());
         }
+
+        // Under WAL two processes can reach here at once, so take the write
+        // lock first and re-read the version under it.
+        let tx = self.write_tx()?;
+        let found: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if found == 0 {
+            tx.execute_batch(SCHEMA)?;
+        } else {
+            for step in &MIGRATIONS[(found as usize - 1)..] {
+                tx.execute_batch(step)?;
+            }
+        }
+        if found != crate::SCHEMA_VERSION {
+            tx.pragma_update(None, "user_version", crate::SCHEMA_VERSION)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -105,6 +121,31 @@ impl Store {
         self.root.join("logs").join(id.get().to_string())
     }
 
+    /// Write inline Rust source into the store and hand back its path.
+    ///
+    /// Content-addressed, so the same source submitted twice is one file and
+    /// a rolled-back transaction leaves nothing but a reusable script. The
+    /// write is a temp file plus a rename, so a reader never sees half a
+    /// script.
+    fn write_script(&self, source: &str) -> Result<PathBuf> {
+        use std::hash::{Hash, Hasher};
+
+        let dir = self.root.join("scripts");
+        std::fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        let path = dir.join(format!("{:016x}.rs", hasher.finish()));
+        if path.exists() {
+            return Ok(path);
+        }
+
+        let tmp = path.with_extension("rs.tmp");
+        std::fs::write(&tmp, source).map_err(|e| Error::io(&tmp, e))?;
+        std::fs::rename(&tmp, &path).map_err(|e| Error::io(&path, e))?;
+        Ok(path)
+    }
+
     /// Insert a job and its edges in one transaction. The job is `ready` when
     /// it has no unmet dependencies and `pending` otherwise; nothing else
     /// decides the runnable set.
@@ -122,10 +163,23 @@ impl Store {
             }
         }
 
-        let (kind, command) = match &job.kind {
-            JobKind::Command(c) => ("command", Some(c)),
-            JobKind::Barrier => ("barrier", None),
+        // A Rust job is a command job once its script exists on disk; the
+        // only difference the store keeps is the path it remembers.
+        let (kind, command, script_path) = match &job.kind {
+            JobKind::Command(c) => ("command", Some(c.clone()), None),
+            JobKind::Barrier => ("barrier", None, None),
+            JobKind::Rust(script) => {
+                let path = match &script.source {
+                    RustSource::File(p) => p.clone(),
+                    RustSource::Inline(_) => {
+                        let text = script.render().expect("inline source renders");
+                        self.write_script(&text)?
+                    }
+                };
+                ("command", Some(Command::rust_script(&path)), Some(path))
+            }
         };
+        let command = command.as_ref();
         let state = if job.deps.is_empty() {
             State::Ready
         } else {
@@ -134,11 +188,11 @@ impl Store {
 
         tx.execute(
             "INSERT INTO jobs (
-                 name, kind, shell, program, cwd,
+                 name, kind, shell, program, cwd, script_path,
                  cpus, gpus, mem_mb, est_secs, kill_after_secs,
                  eval_prompt, retries, idempotent, failure_policy,
                  state, submitted_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 job.name,
                 kind,
@@ -146,6 +200,9 @@ impl Store {
                 command.map(|c| c.program.as_str()),
                 command
                     .and_then(|c| c.cwd.as_ref())
+                    .map(|p| p.to_string_lossy().into_owned()),
+                script_path
+                    .as_ref()
                     .map(|p| p.to_string_lossy().into_owned()),
                 job.resources.cpus,
                 job.resources.gpus,
@@ -248,6 +305,9 @@ impl Store {
             exit_code: row.get::<_, Option<i64>>("exit_code")?.map(|c| c as i32),
             failure: row.get("failure")?,
             eval_prompt: row.get("eval_prompt")?,
+            script: row
+                .get::<_, Option<String>>("script_path")?
+                .map(PathBuf::from),
             resources: Resources {
                 cpus: row.get::<_, i64>("cpus")? as u32,
                 gpus: row.get::<_, i64>("gpus")? as u32,
@@ -380,9 +440,9 @@ fn policy_str(p: crate::job::FailurePolicy) -> &'static str {
 }
 
 const SELECT_ALL: &str = "SELECT id, name, kind, state, stalled, attempt, exit_code, failure,
-     eval_prompt, cpus, gpus, mem_mb, est_secs, submitted_at, started_at, finished_at
+     eval_prompt, script_path, cpus, gpus, mem_mb, est_secs, submitted_at, started_at, finished_at
      FROM jobs";
 
 const SELECT_JOB: &str = "SELECT id, name, kind, state, stalled, attempt, exit_code, failure,
-     eval_prompt, cpus, gpus, mem_mb, est_secs, submitted_at, started_at, finished_at
+     eval_prompt, script_path, cpus, gpus, mem_mb, est_secs, submitted_at, started_at, finished_at
      FROM jobs WHERE id = ?1";

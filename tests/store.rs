@@ -111,3 +111,38 @@ fn unimplemented_paths_say_so_rather_than_lying() {
     ));
     assert!(matches!(q.reap(), Err(Error::NotImplemented(_))));
 }
+
+#[test]
+fn opens_a_store_written_by_an_older_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("store.db");
+
+    // Build a v1 store by hand: the v2 column did not exist yet.
+    {
+        let q = Queue::options()
+            .work_on_submit(false)
+            .open(dir.path())
+            .unwrap();
+        q.submit(Job::cmd("echo old")).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("ALTER TABLE jobs DROP COLUMN script_path; PRAGMA user_version = 1;")
+            .unwrap();
+    }
+
+    // Reopening migrates it forward, old rows intact.
+    let q = Queue::options()
+        .work_on_submit(false)
+        .open(dir.path())
+        .unwrap();
+    assert_eq!(q.list(Filter::All).unwrap().len(), 1);
+    let id = q.submit(Job::rust("fn main() {}")).unwrap();
+    assert!(q.status(id).unwrap().script.is_some());
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, pekaren::SCHEMA_VERSION);
+}

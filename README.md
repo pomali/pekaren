@@ -51,9 +51,25 @@ q.submit(Job::barrier()
     .on_done("pec-evaluate --sweep lr"))?;
 ```
 
-Rust is the scripting surface: an agent writes one `.rs` file with an inline
-dependency manifest (cargo's single-file script support), so there is no
-project scaffolding. Loops and fan-outs are ordinary code — collect the
+A job can also *be* Rust, with no file to manage:
+
+```rust
+q.submit(Job::rust(r#"
+    fn main() {
+        println!("sum={}", (1..=10).sum::<u32>());
+    }
+"#).rust_manifest("[dependencies]\nserde_json = \"1\""))?;
+```
+
+The source is written into the store at submit time, content-addressed, and
+run as a single-file script — `cargo -Zscript` by default, which needs a
+nightly toolchain, or whatever `PEKAREN_RUST_RUNNER` names. `Job::rust_file`
+runs an existing `.rs` where it lies. The path lands in `JobStatus::script`,
+so an evaluator can read the code that produced the output.
+
+Rust is the scripting surface at both levels: an agent writes one `.rs` file
+with an inline dependency manifest (cargo's single-file script support), so
+there is no project scaffolding. Loops and fan-outs are ordinary code — collect the
 handles into a `Vec`, then submit one barrier that depends on all of them.
 See [`examples/sweep.rs`](examples/sweep.rs).
 

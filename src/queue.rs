@@ -74,6 +74,9 @@ pub struct JobStatus {
     pub failure: Option<String>,
     /// The prompt written at submit time, for whoever judges the output.
     pub eval_prompt: Option<String>,
+    /// The `.rs` file behind a Rust job — worth handing to an evaluator
+    /// along with the output, since it *is* the job.
+    pub script: Option<PathBuf>,
     pub resources: Resources,
     pub submitted_at: SystemTime,
     pub started_at: Option<SystemTime>,

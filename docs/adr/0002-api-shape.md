@@ -45,6 +45,30 @@ in a terminal. `Job::exec("python", ["train.py", "--lr", "3e-4"])` execs
 directly with no shell, for anything built from untrusted or awkward values.
 Both produce the same `Command`; only the `shell` flag differs.
 
+### Rust source is a job kind, not a command the caller assembles
+
+`Job::rust("fn main() { .. }")` takes source; `Job::rust_file(p)` takes a
+path; `rust_manifest` supplies the inline dependency manifest. The store
+writes inline source under `<store>/scripts`, content-addressed, and records
+the path in `JobStatus::script`.
+
+The alternative was leaving it to the caller: write a file, then
+`Job::cmd("cargo -Zscript ./thing.rs")`. That makes every caller invent a
+place to put the file, and it puts the code out of the store's reach — an
+evaluator waking an hour later gets the output but not the thing that
+produced it.
+
+Content-addressing rather than naming by job id means submitting the same
+source twice is one file, and a rolled-back transaction leaves a reusable
+script rather than litter.
+
+The runner is resolved at submit time and stored as an ordinary argv, so the
+job runs the same way later whatever the worker's environment looks like.
+`cargo -Zscript` is the default and needs nightly; `PEKAREN_RUST_RUNNER`
+overrides it with a command line the script path is appended to. Nothing
+about this is special-cased downstream: by the time a worker sees it, a Rust
+job is a command job.
+
 ### The evaluation prompt is a field on the job, not a side table
 
 `eval_prompt` sits on `Job` and on `JobStatus`, written at submit time and

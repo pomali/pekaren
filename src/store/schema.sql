@@ -1,4 +1,4 @@
--- pekaren store, schema v1.
+-- pekaren store, schema v2.
 --
 -- Every process that opens this file is a client and potentially a worker;
 -- there is no daemon and no single writer. Three rules follow from that and
@@ -27,6 +27,9 @@ CREATE TABLE jobs (
   shell          INTEGER NOT NULL DEFAULT 0,  -- run through sh -c
   program        TEXT,
   cwd            TEXT,
+  -- The .rs file behind a Rust job: content-addressed under <store>/scripts
+  -- for inline source, or the caller's own path. NULL for everything else.
+  script_path    TEXT,
 
   -- Declaration: admission control, and the baseline for the actual run.
   cpus           INTEGER NOT NULL DEFAULT 1,

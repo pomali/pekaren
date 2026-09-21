@@ -58,6 +58,27 @@ impl Command {
         self.env.push((key.into(), value.into()));
         self
     }
+
+    /// How a single-file Rust script is run.
+    ///
+    /// `cargo -Zscript` by default, which needs a nightly toolchain;
+    /// `PEKAREN_RUST_RUNNER` overrides it with a whitespace-separated
+    /// command line the script path is appended to (`rust-script`, say, or
+    /// a wrapper of your own). Resolved at submit time and stored, so the
+    /// job runs the same way an hour later whatever the worker's
+    /// environment looks like.
+    pub fn rust_script(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref().to_string_lossy().into_owned();
+        match std::env::var("PEKAREN_RUST_RUNNER") {
+            Ok(runner) if !runner.trim().is_empty() => {
+                let mut words = runner.split_whitespace().map(str::to_owned);
+                let program = words.next().expect("non-empty after trim check");
+                let args: Vec<String> = words.chain(std::iter::once(path)).collect();
+                Command::exec(program, args)
+            }
+            _ => Command::exec("cargo", ["+nightly", "-Zscript", &path]),
+        }
+    }
 }
 
 impl From<&str> for Command {
@@ -72,10 +93,51 @@ impl From<String> for Command {
     }
 }
 
+/// Rust source to run as a job, rather than a command line.
+///
+/// Rust is already the scripting surface for building the graph; this is the
+/// same thing one level down, so a job can be a few lines of Rust without a
+/// separate file, a `python -c`, or a shell quoting puzzle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RustScript {
+    pub source: RustSource,
+    /// An inline dependency manifest, written into the script's frontmatter.
+    /// Ignored when the source already carries its own.
+    pub manifest: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RustSource {
+    /// Source text, written into the store at submit time.
+    Inline(String),
+    /// An existing `.rs` file, run where it lies.
+    File(PathBuf),
+}
+
+impl RustScript {
+    /// The text as it will be written: the source, with a frontmatter
+    /// manifest in front of it when one was declared and the source has
+    /// none of its own.
+    pub fn render(&self) -> Option<String> {
+        let RustSource::Inline(source) = &self.source else {
+            return None;
+        };
+        let has_frontmatter = source.trim_start().starts_with("---");
+        Some(match &self.manifest {
+            Some(manifest) if !has_frontmatter => {
+                format!("---\n{}\n---\n\n{source}", manifest.trim())
+            }
+            _ => source.clone(),
+        })
+    }
+}
+
 /// What a node is: work, or a place where work meets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobKind {
     Command(Command),
+    /// Rust source, run as a single-file script.
+    Rust(RustScript),
     /// A node with no command of its own that fires when its dependencies
     /// settle. Notification hangs off barriers, not leaves, so an expensive
     /// context is pinged once per subgraph rather than once per job.
@@ -213,6 +275,58 @@ impl Job {
     /// A job built from a [`Command`] you assembled yourself.
     pub fn run(command: Command) -> Self {
         Job::new(JobKind::Command(command))
+    }
+
+    /// A job that runs Rust source directly.
+    ///
+    /// The source is written into the store at submit time and run as a
+    /// single-file script, so a job can be Rust without a file to manage or
+    /// a project to scaffold. Add dependencies with
+    /// [`rust_manifest`](Job::rust_manifest).
+    ///
+    /// ```no_run
+    /// # use pekaren::prelude::*;
+    /// # fn main() -> Result<()> {
+    /// # let q = Queue::open_default()?;
+    /// q.submit(
+    ///     Job::rust(r#"fn main() { println!("hello from a job"); }"#)
+    ///         .eval_prompt("Should print a greeting"),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn rust(source: impl Into<String>) -> Self {
+        Job::new(JobKind::Rust(RustScript {
+            source: RustSource::Inline(source.into()),
+            manifest: None,
+        }))
+    }
+
+    /// A job that runs an existing `.rs` file as a single-file script,
+    /// where it lies. Nothing is copied, so edits to the file before it is
+    /// claimed are picked up.
+    pub fn rust_file(path: impl AsRef<Path>) -> Self {
+        Job::new(JobKind::Rust(RustScript {
+            source: RustSource::File(path.as_ref().to_path_buf()),
+            manifest: None,
+        }))
+    }
+
+    /// The inline dependency manifest for a [`Job::rust`] source, as the
+    /// body of a cargo script's frontmatter:
+    ///
+    /// ```no_run
+    /// # use pekaren::prelude::*;
+    /// Job::rust("fn main() { /* ... */ }").rust_manifest("[dependencies]\nserde_json = \"1\"");
+    /// ```
+    ///
+    /// Ignored on any other kind of job, and on source that already carries
+    /// its own frontmatter.
+    pub fn rust_manifest(mut self, manifest: impl Into<String>) -> Self {
+        if let JobKind::Rust(script) = &mut self.kind {
+            script.manifest = Some(manifest.into());
+        }
+        self
     }
 
     /// A barrier: no command, fires when its dependencies settle.

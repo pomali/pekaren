@@ -1,9 +1,9 @@
 # Pekáreň — design
 
-Source of truth: the living design doc at
-<https://claude.ai/artifact/F4pcFesvoGBQAcBex9x5hY>. This file is the version
-the code in this repository is built against; where they disagree, the doc
-wins and this file needs updating.
+The design the code in this repository is built against. Decisions taken
+while implementing it, and the alternatives they beat, live in
+[`adr/`](adr/); what is built and what is not is in
+[`roadmap.md`](roadmap.md).
 
 ## Overview
 
@@ -41,7 +41,9 @@ whether the job is safe to re-run.
 
 **Rust as the scripting surface.** Agents write a single `.rs` file with an
 inline dependency manifest, so there is no project scaffolding. Loops and
-fan-outs are ordinary code.
+fan-outs are ordinary code. A job itself can be Rust source rather than a
+command line (`Job::rust`), written into the store at submit time and run as
+a single-file script.
 
 **Grace window.** After submitting, the script stays attached for a short
 window (5–10 s). A job that dies in that window almost always failed on

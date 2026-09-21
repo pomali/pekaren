@@ -48,7 +48,9 @@ mod worker;
 
 pub use error::{Error, Result};
 pub use id::JobId;
-pub use job::{Command, FailurePolicy, Job, JobKind, KillAfter, Resources, Wake};
+pub use job::{
+    Command, FailurePolicy, Job, JobKind, KillAfter, Resources, RustScript, RustSource, Wake,
+};
 pub use profile::{Profile, Sample};
 pub use queue::{
     Filter, JobStatus, Logs, Queue, QueueOptions, ReapReport, State, default_store_path,
@@ -67,4 +69,4 @@ pub mod prelude {
 
 /// Schema version this build speaks. A store written by a newer build is
 /// refused rather than migrated backwards.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
