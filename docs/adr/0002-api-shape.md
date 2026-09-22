@@ -191,6 +191,25 @@ return `Error::NotImplemented("Queue::wait")`. A caller can write the whole
 script today and find out precisely what is missing, instead of getting a
 plausible wrong answer. A test asserts this stays true.
 
+### The grace window is a probe, not a full stop
+
+The design asks the submitting script to stay attached for 5–10 seconds so
+a job that dies on a bad path comes back as an error from `submit`. Taken
+literally, a loop that submits ten jobs pays the window ten times over
+while nothing is wrong.
+
+So `submit` waits until the job settles, or until it has been *running* for
+a second, whichever comes first, and gives up at the grace deadline.
+Failures of the kind the window exists for — a missing binary, an
+unreadable path — happen in milliseconds, so a second of life is enough
+evidence, and a sweep submits at the speed of the store.
+
+Work happens in a background thread of the submitting process, started by
+the first submit. That keeps a script that submits and then keeps working a
+complete system on its own. It also means a script that submits and exits
+leaves its jobs for the next worker — `pec work`, or the next script — which
+is what daemon-free costs.
+
 ## Consequences
 
 - `Queue` is `Send` but not `Sync` (it holds one `rusqlite::Connection`).

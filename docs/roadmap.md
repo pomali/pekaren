@@ -6,22 +6,20 @@ store still readable by the previous build where the schema allows it.
 ## 1 — Interface and store (done)
 
 The public API, the schema, submit and read paths, decisions written down.
-Execution entry points exist and return `Error::NotImplemented`.
 
-## 2 — Execution
+## 2 — Execution (done)
 
-- Claim: pick a runnable job whose declaration fits the free pool, write a
-  lease with a token and an expiry, all in one `BEGIN IMMEDIATE`.
-- Before running anything, `check_inputs`: fatal drift fails the job with
-  what moved, the rest is recorded and travels with the result.
-- Set `PEKAREN_JOB` and `PEKAREN_STORE` on the child so a task can reach
-  its own context.
-- Supervise: spawn the child, record PID + process start time, renew the
-  lease, enforce the wall-clock cap.
-- Commit: write `done`/`failed` only `WHERE lease_token` is still ours, then
-  move the scratch directory into place.
-- `Queue::wait`, `Queue::cancel`, `Worker::run_*`, and the grace window
-  turning an early death into `Error::EarlyFailure`.
+Claim under one `BEGIN IMMEDIATE` against a free pool counted from live
+leases; check the job's inputs before running anything; spawn the child
+with `PEKAREN_JOB`, `PEKAREN_SCRATCH` and its GPUs; renew the lease and
+sample the child while it runs; kill it at its cap; commit only while the
+lease still holds our token, and publish the scratch directory after. Plus
+retries for idempotent jobs, barrier settlement under both policies,
+`Queue::wait`, `Queue::cancel`, `Queue::reap`, the grace window, and
+`pec work` / `wait` / `reap`.
+
+Left over from it: cancelling a *running* job (today cancel only stops one
+that has not started), and reclaiming a lease left by another host.
 
 ## 3 — Handoff
 
@@ -41,7 +39,8 @@ Execution entry points exist and return `Error::NotImplemented`.
 
 ## 5 — Profiling
 
-- The sampler thread, the `samples` table, per-attempt rollups.
+- Samples are collected and rolled up already; what is missing is GPU
+  utilisation and surfacing any of it.
 - Stall detection feeding the stuck-job path.
 - "estimated 20 min, took 90 min, averaged 1.2 of 8 cores" in `pec status`.
 

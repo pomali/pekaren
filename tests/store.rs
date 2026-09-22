@@ -102,14 +102,15 @@ fn store_is_in_wal_mode() {
 }
 
 #[test]
-fn unimplemented_paths_say_so_rather_than_lying() {
+fn waiting_on_work_nobody_runs_times_out() {
     let (_dir, q) = temp_queue();
     let id = q.submit(Job::cmd("true")).unwrap();
-    assert!(matches!(
-        q.wait(&[id], Some(Duration::from_millis(1))),
-        Err(Error::NotImplemented(_))
-    ));
-    assert!(matches!(q.reap(), Err(Error::NotImplemented(_))));
+    // No worker in this test, so the job never settles.
+    match q.wait(&[id], Some(Duration::from_millis(50))) {
+        Err(Error::WaitTimeout(1)) => {}
+        other => panic!("expected a timeout naming one job, got {other:?}"),
+    }
+    assert_eq!(q.status(id).unwrap().state, State::Ready);
 }
 
 #[test]

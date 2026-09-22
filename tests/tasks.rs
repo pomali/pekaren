@@ -5,6 +5,7 @@
 //! worker will run it.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use pekaren::prelude::*;
 use pekaren::{DriftKind, InputKind, Level};
@@ -21,6 +22,29 @@ fn tasks() -> (Tasks, Task) {
     let mut tasks = Tasks::new();
     let marker = tasks.add("write-marker", write_marker);
     (tasks, marker)
+}
+
+#[test]
+fn the_macro_registers_and_names_a_task() {
+    // A worker runs this binary with no arguments, so every test in it
+    // runs in the child too. This one has nothing to dispatch: it steps
+    // aside and lets the test below do it.
+    if Tasks::assigned_task().is_some() {
+        return;
+    }
+
+    // No PEKAREN_TASK in this process, so the macro returns the handles
+    // rather than dispatching. The name comes from the function's own.
+    let (one, two) = pekaren::tasks!(write_marker, other_marker).unwrap();
+    assert_eq!(one.name(), "write_marker");
+    assert_eq!(two.name(), "other_marker");
+
+    let single = pekaren::tasks!(write_marker).unwrap();
+    assert_eq!(single.name(), "write_marker");
+}
+
+fn other_marker(_ctx: &JobCtx) -> TaskResult {
+    Ok(())
 }
 
 #[test]
@@ -99,6 +123,22 @@ fn a_task_job_runs_the_function_in_this_binary() {
     let written = std::fs::read_to_string(&marker_file).expect("the task ran");
     assert!(written.starts_with(&id.to_string()), "{written}");
     assert!(written.contains("--lr=3e-4"), "{written}");
+
+    // And now the real path: a worker claims the job and re-executes this
+    // binary itself. (Every test in the binary runs in the child, which is
+    // why the other one steps aside when PEKAREN_TASK is set.)
+    let second_marker = dir.path().join("marker2.txt");
+    let worker_job = q
+        .submit(Job::task(marker).arg(second_marker.to_string_lossy()))
+        .unwrap();
+    pekaren::Worker::new(&q)
+        .poll_interval(Duration::from_millis(10))
+        .run_until_idle()
+        .unwrap();
+
+    assert_eq!(q.status(worker_job).unwrap().state, State::Done);
+    let written = std::fs::read_to_string(&second_marker).expect("the worker ran the task");
+    assert!(written.starts_with(&worker_job.to_string()), "{written}");
 
     // A changed input warns and is recorded; the job is still runnable.
     std::fs::write(dataset.join("b.csv"), "4,5,6\n").unwrap();

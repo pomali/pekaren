@@ -547,6 +547,473 @@ impl Store {
     }
 }
 
+/// A job a worker has taken, with everything it needs to run it.
+pub(crate) struct Claim {
+    pub id: JobId,
+    pub attempt: u32,
+    pub token: String,
+    pub command: Command,
+    pub scratch: PathBuf,
+    pub gpus: Vec<u32>,
+    pub kill_after: Option<Duration>,
+    pub task: Option<String>,
+}
+
+impl Claim {
+    /// How to describe this job in an event: the task it runs, or the
+    /// command it is.
+    pub(crate) fn describe(&self) -> String {
+        match &self.task {
+            Some(task) => format!("task {task}"),
+            None => self.command.program.clone(),
+        }
+    }
+}
+
+impl Store {
+    /// Take the oldest runnable job that fits what is free, in one
+    /// transaction: read the pool, pick a slice, write the lease. Losing
+    /// the race to another process means the update matches nothing, and
+    /// the next call tries again.
+    pub(crate) fn claim_next(
+        &self,
+        host: &str,
+        capacity: &crate::worker::Capacity,
+        lease: Duration,
+    ) -> Result<Option<Claim>> {
+        let tx = self.write_tx()?;
+        let now = now_ms();
+
+        // What this host has already lent out, counted from live leases so
+        // it cannot drift from the jobs actually running.
+        let (used_cpus, used_mem): (i64, i64) = tx.query_row(
+            "SELECT COALESCE(SUM(cpus), 0), COALESCE(SUM(mem_mb), 0)
+             FROM jobs
+             WHERE state = 'running' AND lease_host = ?1 AND lease_expires_at > ?2",
+            params![host, now],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut free_gpus: Vec<u32> = {
+            let mut stmt = tx.prepare("SELECT device FROM gpu_claims WHERE host = ?1")?;
+            let taken = stmt
+                .query_map([host], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            capacity
+                .gpus
+                .iter()
+                .copied()
+                .filter(|d| !taken.contains(&(*d as i64)))
+                .collect()
+        };
+        let free_cpus = (capacity.cpus as i64 - used_cpus).max(0);
+        let free_mem = (capacity.mem_mb as i64 - used_mem).max(0);
+
+        // Barriers are settled here rather than run: they have no command.
+        /// The columns a claim needs off the runnable view.
+        struct Candidate {
+            id: i64,
+            gpus: i64,
+            kill_after_secs: Option<i64>,
+            task: Option<String>,
+        }
+
+        let candidate: Option<Candidate> = tx
+            .query_row(
+                "SELECT id, gpus, kill_after_secs, task_name
+                 FROM runnable
+                 WHERE kind = 'command'
+                   AND cpus <= ?1 AND mem_mb <= ?2 AND gpus <= ?3
+                 ORDER BY id LIMIT 1",
+                params![free_cpus, free_mem, free_gpus.len() as i64],
+                |r| {
+                    Ok(Candidate {
+                        id: r.get(0)?,
+                        gpus: r.get(1)?,
+                        kill_after_secs: r.get(2)?,
+                        task: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let id = JobId::new(candidate.id);
+
+        let token = lease_token(host);
+        let scratch = self.root.join("scratch").join(&token);
+        let attempt: i64 = tx.query_row(
+            "SELECT attempt + 1 FROM jobs WHERE id = ?1",
+            [id.get()],
+            |r| r.get(0),
+        )?;
+
+        let changed = tx.execute(
+            "UPDATE jobs
+             SET state = 'running', attempt = ?2, lease_token = ?3, lease_host = ?4,
+                 lease_expires_at = ?5, scratch_dir = ?6,
+                 started_at = COALESCE(started_at, ?7), stalled = 0
+             WHERE id = ?1 AND state IN ('pending', 'ready')",
+            params![
+                id.get(),
+                attempt,
+                token,
+                host,
+                now + lease.as_millis() as i64,
+                scratch.to_string_lossy().into_owned(),
+                now,
+            ],
+        )?;
+        if changed == 0 {
+            // Someone else took it between the read and the write.
+            return Ok(None);
+        }
+
+        free_gpus.truncate(candidate.gpus as usize);
+        for device in &free_gpus {
+            tx.execute(
+                "INSERT INTO gpu_claims (host, device, job_id, lease_token)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![host, *device as i64, id.get(), token],
+            )?;
+        }
+
+        tx.execute(
+            "INSERT INTO attempts (job_id, n, host, lease_token, started_at, scratch_dir)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id.get(),
+                attempt,
+                host,
+                token,
+                now,
+                scratch.to_string_lossy().into_owned()
+            ],
+        )?;
+
+        tx.commit()?;
+
+        let command = self.command_of(id)?.expect("a command job has a command");
+        Ok(Some(Claim {
+            id,
+            attempt: attempt as u32,
+            token,
+            command,
+            scratch,
+            gpus: free_gpus,
+            kill_after: candidate
+                .kill_after_secs
+                .map(|s| Duration::from_secs(s as u64)),
+            task: candidate.task,
+        }))
+    }
+
+    /// Record the child we started, so a reclaimer can kill the right
+    /// process later. PID alone is not enough: they get recycled.
+    pub(crate) fn record_child(&self, claim: &Claim, pid: u32, pid_start: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE jobs SET lease_pid = ?2, lease_pid_start = ?3
+             WHERE id = ?1 AND lease_token = ?4",
+            params![claim.id.get(), pid as i64, pid_start, claim.token],
+        )?;
+        self.conn.execute(
+            "UPDATE attempts SET pid = ?3, pid_start = ?4 WHERE job_id = ?1 AND n = ?2",
+            params![claim.id.get(), claim.attempt as i64, pid as i64, pid_start],
+        )?;
+        Ok(())
+    }
+
+    /// Push the lease out. Returns false once the lease is no longer ours,
+    /// which is the worker's signal to stop before doing anything
+    /// expensive or destructive.
+    pub(crate) fn renew(&self, claim: &Claim, lease: Duration) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE jobs SET lease_expires_at = ?2 WHERE id = ?1 AND lease_token = ?3",
+            params![
+                claim.id.get(),
+                now_ms() + lease.as_millis() as i64,
+                claim.token
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Write the outcome, but only while the lease still holds our token.
+    ///
+    /// This is the exactly-once commit: if another process reclaimed the
+    /// job, the token changed, nothing is written, and the caller throws
+    /// its output away.
+    pub(crate) fn commit(
+        &self,
+        claim: &Claim,
+        outcome: Outcome,
+        exit_code: Option<i32>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let tx = self.write_tx()?;
+        let now = now_ms();
+
+        // A failed job that may safely run again goes back to the pool
+        // rather than to a human.
+        let (state, attempt_outcome) = match outcome {
+            Outcome::Done => ("done", "done"),
+            Outcome::Failed => {
+                let (retries, idempotent, attempt): (i64, i64, i64) = tx.query_row(
+                    "SELECT retries, idempotent, attempt FROM jobs WHERE id = ?1",
+                    [claim.id.get()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+                if idempotent != 0 && attempt <= retries {
+                    ("ready", "failed")
+                } else {
+                    ("failed", "failed")
+                }
+            }
+            Outcome::Killed => ("failed", "killed"),
+            Outcome::Cancelled => ("cancelled", "cancelled"),
+        };
+
+        let changed = tx.execute(
+            "UPDATE jobs
+             SET state = ?2,
+                 exit_code = ?3,
+                 failure = ?4,
+                 finished_at = CASE WHEN ?2 = 'ready' THEN NULL ELSE ?5 END,
+                 lease_token = NULL, lease_expires_at = NULL,
+                 lease_pid = NULL, lease_pid_start = NULL
+             WHERE id = ?1 AND lease_token = ?6",
+            params![claim.id.get(), state, exit_code, note, now, claim.token],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        tx.execute(
+            "UPDATE attempts
+             SET finished_at = ?3, exit_code = ?4, outcome = ?5,
+                 wall_secs = (?3 - started_at) / 1000.0
+             WHERE job_id = ?1 AND n = ?2",
+            params![
+                claim.id.get(),
+                claim.attempt as i64,
+                now,
+                exit_code,
+                attempt_outcome
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM gpu_claims WHERE lease_token = ?1",
+            [&claim.token],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Reclaim leases that have rotted, and say whose children may still be
+    /// alive so the caller can kill them.
+    pub(crate) fn reclaim_expired(&self, host: &str) -> Result<Vec<Orphan>> {
+        let tx = self.write_tx()?;
+        let now = now_ms();
+
+        let mut stmt = tx.prepare(
+            "SELECT id, lease_token, lease_pid, lease_pid_start, idempotent, retries, attempt
+             FROM jobs
+             WHERE state = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?1
+               AND (lease_host = ?2 OR lease_host = '' OR lease_host IS NULL)",
+        )?;
+        let rotted = stmt
+            .query_map(params![now, host], |r| {
+                Ok((
+                    JobId::new(r.get(0)?),
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, i64>(4)? != 0,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut orphans = Vec::new();
+        for (id, token, pid, pid_start, idempotent, retries, attempt) in rotted {
+            // A job that cannot safely run twice does not go back in the
+            // pool, however innocent the crash looked.
+            let state = if idempotent && attempt <= retries + 1 {
+                "ready"
+            } else {
+                "failed"
+            };
+            tx.execute(
+                "UPDATE jobs
+                 SET state = ?2, lease_token = NULL, lease_expires_at = NULL,
+                     lease_pid = NULL, lease_pid_start = NULL,
+                     failure = CASE WHEN ?2 = 'failed'
+                         THEN 'lease expired and the job is not safe to re-run' END,
+                     finished_at = CASE WHEN ?2 = 'failed' THEN ?3 END
+                 WHERE id = ?1 AND lease_token = ?4",
+                params![id.get(), state, now, token],
+            )?;
+            tx.execute(
+                "UPDATE attempts SET finished_at = ?3, outcome = 'reclaimed'
+                 WHERE job_id = ?1 AND lease_token = ?2 AND finished_at IS NULL",
+                params![id.get(), token, now],
+            )?;
+            tx.execute("DELETE FROM gpu_claims WHERE lease_token = ?1", [&token])?;
+            tx.execute(
+                "INSERT INTO job_events (job_id, at, level, message) VALUES (?1, ?2, 'warn', ?3)",
+                params![
+                    id.get(),
+                    now,
+                    format!("lease expired; job moved to {state}")
+                ],
+            )?;
+            orphans.push(Orphan {
+                id,
+                pid: pid.map(|p| p as u32),
+                pid_start,
+            });
+        }
+
+        tx.commit()?;
+        Ok(orphans)
+    }
+
+    /// Settle every barrier whose dependencies have decided, applying its
+    /// failure policy. Returns the ones that changed state.
+    pub(crate) fn settle_barriers(&self) -> Result<Vec<(JobId, State)>> {
+        let tx = self.write_tx()?;
+        let now = now_ms();
+
+        let mut stmt = tx.prepare(
+            "SELECT b.id, b.failure_policy,
+                    (SELECT COUNT(*) FROM deps d JOIN jobs p ON p.id = d.parent_id
+                      WHERE d.child_id = b.id AND p.state IN ('failed', 'cancelled')),
+                    (SELECT COUNT(*) FROM deps d JOIN jobs p ON p.id = d.parent_id
+                      WHERE d.child_id = b.id
+                        AND p.state NOT IN ('done', 'failed', 'cancelled'))
+             FROM jobs b
+             WHERE b.kind = 'barrier' AND b.state IN ('pending', 'ready')",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    JobId::new(r.get(0)?),
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut settled = Vec::new();
+        for (id, policy, failed, unsettled) in rows {
+            let state = match (failed, unsettled, policy.as_str()) {
+                // Fail-fast notifies the moment a dependency fails; the
+                // rest of the subgraph keeps running but nobody waits on it.
+                (f, _, "fail_fast") if f > 0 => State::Failed,
+                (f, 0, _) if f > 0 => State::Failed,
+                (0, 0, _) => State::Done,
+                _ => continue,
+            };
+            tx.execute(
+                "UPDATE jobs SET state = ?2, finished_at = ?3,
+                     failure = CASE WHEN ?2 = 'failed'
+                         THEN 'a dependency failed' END
+                 WHERE id = ?1 AND state IN ('pending', 'ready')",
+                params![id.get(), state.as_str(), now],
+            )?;
+            settled.push((id, state));
+        }
+
+        tx.commit()?;
+        Ok(settled)
+    }
+
+    pub(crate) fn cancel(&self, id: JobId) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE jobs SET state = 'cancelled', finished_at = ?2
+             WHERE id = ?1 AND state IN ('pending', 'ready')",
+            params![id.get(), now_ms()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn record_samples(
+        &self,
+        claim: &Claim,
+        samples: &[crate::profile::Sample],
+    ) -> Result<()> {
+        let tx = self.write_tx()?;
+        for s in samples {
+            tx.execute(
+                "INSERT OR REPLACE INTO samples (job_id, attempt, at, rss_mb, cpu_cores, gpu_util)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    claim.id.get(),
+                    claim.attempt as i64,
+                    to_ms(s.at),
+                    s.rss_mb as i64,
+                    s.cpu_cores,
+                    s.gpu_util
+                ],
+            )?;
+        }
+        if let Some(profile) = crate::profile::roll_up(samples) {
+            tx.execute(
+                "UPDATE attempts
+                 SET peak_rss_mb = ?3, avg_cores = ?4, idle_fraction = ?5
+                 WHERE job_id = ?1 AND n = ?2",
+                params![
+                    claim.id.get(),
+                    claim.attempt as i64,
+                    profile.peak_rss_mb as i64,
+                    profile.avg_cores,
+                    profile.idle_fraction
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+/// How an attempt ended, from the worker's point of view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Done,
+    Failed,
+    Killed,
+    Cancelled,
+}
+
+/// A child that may still be running with nobody supervising it.
+pub(crate) struct Orphan {
+    pub id: JobId,
+    pub pid: Option<u32>,
+    pub pid_start: Option<i64>,
+}
+
+/// Unique enough that two workers never mint the same one: host, process,
+/// the clock, and a counter for the same process claiming twice in a
+/// millisecond.
+fn lease_token(host: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{host}-{}-{nanos}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn insert_wake(
     tx: &rusqlite::Transaction<'_>,
     job: JobId,

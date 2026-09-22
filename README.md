@@ -17,19 +17,31 @@ comes back only when it is cheap or when the user asks.
 
 Full design: [`docs/design.md`](docs/design.md).
 
-## Status — milestone 1
+## Status — jobs run
 
-This repository currently holds the **interface and the store**, which is
-what the design needed to settle first:
+Submitted work actually executes: a worker claims a job with a lease, runs
+it, samples it, and commits the result only while the lease still holds its
+token. Barriers settle, failed leases are reclaimed, `wait` waits.
 
-- the public API (`Queue`, `Job`, `JobId`, `Wake`, `Worker`), built by value
+- the public API (`Queue`, `Job`, `JobId`, `Task`, `Wake`, `Worker`)
 - the SQLite schema, in [`src/store/schema.sql`](src/store/schema.sql)
-- submit and read paths, working against a real store
+- execution: claim, supervise, kill at the cap, conditional commit, retries
+- change detection on everything a job depends on
 - decisions written down in [`docs/adr/`](docs/adr/)
 
-Execution is next and is not pretended: `Queue::wait`, `Queue::reap`,
-`Queue::cancel` and the `Worker` loop return `Error::NotImplemented` rather
-than a plausible-looking wrong answer. See [`docs/roadmap.md`](docs/roadmap.md).
+Not built yet: the handoff — spawning the wake command when a barrier
+settles — and the profiling that `pec status` should show. See
+[`docs/roadmap.md`](docs/roadmap.md).
+
+With no daemon, someone has to be the worker. Either the submitting process
+stays alive (it runs one in a background thread by default), or you start
+one:
+
+```
+pec work          # run everything claimable, then stop
+pec wait j3       # block until these jobs settle
+pec reap          # reclaim rotted leases, kill orphans
+```
 
 ## Shape of it
 
@@ -128,7 +140,7 @@ beyond a C compiler.
 | `src/hash.rs` | change detection for the paths a job depends on |
 | `src/queue.rs` | `Queue`, `JobStatus`, `State`, submit and read paths |
 | `src/store/` | SQLite: schema, migrations, conditional writes |
-| `src/worker.rs` | claim / supervise / commit loop (milestone 2) |
+| `src/worker.rs` | claim / supervise / commit loop |
 | `src/bin/pec.rs` | the CLI, deliberately thin for now |
 | `docs/adr/` | decisions and the alternatives they beat |
 

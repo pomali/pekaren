@@ -16,14 +16,17 @@ const USAGE: &str = "\
 pec — pekáreň's oven
 
 usage:
+    pec [--store <dir>] work [--once]
     pec [--store <dir>] status [<job-id>]
     pec [--store <dir>] runnable
     pec [--store <dir>] check [<job-id>]
+    pec [--store <dir>] wait <job-id>...
+    pec [--store <dir>] reap
     pec [--store <dir>] where
 
 the store defaults to $PEKAREN_STORE, else ~/.pekaren.
 
-deferred: submit, wait, logs, reap.
+deferred: submit, logs.
 ";
 
 fn main() -> ExitCode {
@@ -93,6 +96,42 @@ fn run() -> Result<()> {
                 return Err(pekaren::Error::NotImplemented(
                     "jobs above depend on code that changed; they fail when claimed",
                 ));
+            }
+        }
+        // With no daemon, this is how work gets done when the script
+        // that submitted it has gone: a worker anyone can start.
+        "work" => {
+            let q = open()?;
+            let once = args.next().as_deref() == Some("--once");
+            let mut worker = pekaren::Worker::new(&q);
+            let report = if once {
+                worker.run_one()?;
+                Default::default()
+            } else {
+                worker.run_until_idle()?
+            };
+            for id in &report.committed {
+                println!("{id} done");
+            }
+            for id in &report.failed {
+                println!("{id} failed");
+            }
+        }
+        "wait" => {
+            let q = open()?;
+            let ids = args.map(|a| parse_id(&a)).collect::<Result<Vec<_>>>()?;
+            for s in q.wait(&ids, None)? {
+                print_status(&s);
+            }
+        }
+        "reap" => {
+            let q = open()?;
+            let report = q.reap()?;
+            for id in &report.leases_reclaimed {
+                println!("{id} lease reclaimed");
+            }
+            for id in &report.orphans_killed {
+                println!("{id} orphan killed");
             }
         }
         "runnable" => {

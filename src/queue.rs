@@ -238,6 +238,23 @@ impl QueueOptions {
 pub struct Queue {
     store: Store,
     opts: QueueOptions,
+    /// Set once this process has a worker thread of its own.
+    worker: std::cell::OnceCell<BackgroundWorker>,
+}
+
+/// A worker running in a thread of this process, started by the first
+/// submit when the queue was opened with `work_on_submit`.
+struct BackgroundWorker {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for BackgroundWorker {
+    fn drop(&mut self) {
+        // Ask it to stop claiming. A job already running is left to finish
+        // or, if this process is going away, to have its lease rot and be
+        // reclaimed by the next worker.
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Queue {
@@ -267,11 +284,16 @@ impl Queue {
         Ok(Queue {
             store: Store::open(&root)?,
             opts,
+            worker: std::cell::OnceCell::new(),
         })
     }
 
     pub fn path(&self) -> &Path {
         self.store.root()
+    }
+
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
     }
 
     /// Record a job and return its handle.
@@ -282,11 +304,69 @@ impl Queue {
     /// through the one completion path: one channel, two latencies.
     pub fn submit(&self, job: Job) -> Result<JobId> {
         let id = self.store.insert_job(&job)?;
-        if self.opts.work_on_submit && !self.opts.grace.is_zero() {
-            // Milestone 2: run the local worker for the grace window and
-            // turn an early death into Error::EarlyFailure.
+        if self.opts.work_on_submit {
+            self.start_worker();
+            self.watch_grace_window(id)?;
         }
         Ok(id)
+    }
+
+    /// Start this process's worker thread, once.
+    fn start_worker(&self) {
+        self.worker.get_or_init(|| {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let path = self.store.root().to_path_buf();
+            let flag = stop.clone();
+            // The thread opens its own connection: a store is shared
+            // between processes, so one more reader costs nothing.
+            std::thread::spawn(move || {
+                let Ok(queue) = Queue::options().work_on_submit(false).open(&path) else {
+                    return;
+                };
+                let _ = crate::worker::Worker::new(&queue).run_while(&flag);
+            });
+            BackgroundWorker { stop }
+        });
+    }
+
+    /// Stay attached for the grace window, so a job that dies on something
+    /// trivial — a bad path, a missing binary — comes back as an error from
+    /// `submit` rather than as a notification an hour later.
+    ///
+    /// The window ends when the job settles, when it has been alive long
+    /// enough to have got past the trivial failures, or when the grace
+    /// runs out — whichever comes first. Waiting the full window on a job
+    /// that is plainly running would make a loop of submits crawl, and a
+    /// bad path or a missing binary shows up in milliseconds.
+    fn watch_grace_window(&self, id: JobId) -> Result<()> {
+        let deadline = std::time::Instant::now() + self.opts.grace;
+        let probe = self.opts.grace.min(Duration::from_secs(1));
+        let mut running_since = None;
+        loop {
+            let status = self.store.status(id)?;
+            match status.state {
+                State::Failed => {
+                    let logs = self.logs(id)?;
+                    return Err(Error::EarlyFailure {
+                        id,
+                        exit: status.exit_code,
+                        stderr_tail: crate::worker::stderr_tail(&logs.stderr, 400),
+                    });
+                }
+                State::Done | State::Cancelled => return Ok(()),
+                State::Running => {
+                    let since = running_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= probe {
+                        return Ok(());
+                    }
+                }
+                State::Pending | State::Ready => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Record a job without the grace window, even when the queue was opened
@@ -384,8 +464,23 @@ impl Queue {
     ///
     /// This is the explicit wait: the only call in the crate that blocks on
     /// other people's work.
-    pub fn wait(&self, _ids: &[JobId], _timeout: Option<Duration>) -> Result<Vec<JobStatus>> {
-        Err(Error::NotImplemented("Queue::wait"))
+    pub fn wait(&self, ids: &[JobId], timeout: Option<Duration>) -> Result<Vec<JobStatus>> {
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+        loop {
+            // Barriers settle here too, so waiting on one works in a
+            // process that is not running any jobs itself.
+            self.store.settle_barriers()?;
+            let statuses = self.statuses(ids)?;
+            if statuses.iter().all(|s| s.state.is_settled()) {
+                return Ok(statuses);
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Err(Error::WaitTimeout(
+                    statuses.iter().filter(|s| !s.state.is_settled()).count(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Where this job's output went. Present once an attempt has committed.
@@ -398,15 +493,36 @@ impl Queue {
         })
     }
 
-    pub fn cancel(&self, _id: JobId) -> Result<()> {
-        Err(Error::NotImplemented("Queue::cancel"))
+    /// Cancel a job that has not started. A running job is left alone:
+    /// stopping it is the supervising worker's business, through its cap
+    /// or its lease.
+    pub fn cancel(&self, id: JobId) -> Result<()> {
+        if self.store.cancel(id)? {
+            self.store.record_event(id, "info", "cancelled")?;
+        }
+        Ok(())
     }
 
     /// Sweep the store: reclaim rotted leases, kill orphans, finish handoffs
     /// a dying worker left unfulfilled. Any process may call it, and workers
     /// call it as they start.
     pub fn reap(&self) -> Result<ReapReport> {
-        Err(Error::NotImplemented("Queue::reap"))
+        let mut report = ReapReport::default();
+        for orphan in self.store.reclaim_expired(&crate::worker::hostname())? {
+            report.leases_reclaimed.push(orphan.id);
+            // Kill only a process that matches both the PID and the start
+            // time we recorded: PIDs get recycled, and killing a stranger
+            // is worse than leaving an orphan.
+            if let (Some(pid), Some(start)) = (orphan.pid, orphan.pid_start) {
+                if crate::worker::process_start(pid) == Some(start) && kill(pid) {
+                    report.orphans_killed.push(orphan.id);
+                    self.store
+                        .record_event(orphan.id, "warn", "orphaned child killed")?;
+                }
+            }
+        }
+        self.store.settle_barriers()?;
+        Ok(report)
     }
 }
 
@@ -421,6 +537,21 @@ pub fn default_store_path() -> PathBuf {
         Some(dir) if !dir.is_empty() => expand_tilde(Path::new(&dir)),
         _ => expand_tilde(Path::new("~/.pekaren")),
     }
+}
+
+#[cfg(unix)]
+fn kill(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn kill(_pid: u32) -> bool {
+    false
 }
 
 fn expand_tilde(path: &Path) -> PathBuf {

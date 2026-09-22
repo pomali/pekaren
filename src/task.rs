@@ -39,6 +39,59 @@ use crate::id::JobId;
 use crate::job::Job;
 use crate::queue::Queue;
 
+/// Register tasks, dispatch, and hand back their handles — the whole of
+/// the boilerplate in one line.
+///
+/// Each function's own name becomes its registered name, so there is no
+/// string to keep in step with anything, and the handles come back in the
+/// order given. In a submitting run the macro evaluates to the handles; in
+/// a run a worker started it dispatches the assigned task and exits, so
+/// nothing after it runs.
+///
+/// ```no_run
+/// use pekaren::prelude::*;
+///
+/// fn train(_ctx: &JobCtx) -> TaskResult { Ok(()) }
+/// fn evaluate(_ctx: &JobCtx) -> TaskResult { Ok(()) }
+///
+/// fn main() -> Result<()> {
+///     let (train, evaluate) = pekaren::tasks!(train, evaluate)?;
+///
+///     let q = Queue::open_default()?;
+///     let run = q.submit(Job::task(train).arg("3e-4"))?;
+///     q.submit(Job::task(evaluate).after([run]))?;
+///     Ok(())
+/// }
+/// ```
+///
+/// One task yields one handle rather than a one-element tuple:
+///
+/// ```no_run
+/// # use pekaren::prelude::*;
+/// # fn train(_ctx: &JobCtx) -> TaskResult { Ok(()) }
+/// # fn main() -> Result<()> {
+/// let train = pekaren::tasks!(train)?;
+/// # let _ = train;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Build a [`Tasks`] by hand instead when the set is not known at compile
+/// time, or when a name has to differ from the function's.
+#[macro_export]
+macro_rules! tasks {
+    ($f:path $(,)?) => {{
+        let mut registry = $crate::Tasks::new();
+        let handle = registry.add(stringify!($f), $f);
+        registry.bootstrap().map(|()| handle)
+    }};
+    ($($f:path),+ $(,)?) => {{
+        let mut registry = $crate::Tasks::new();
+        let handles = ($(registry.add(stringify!($f), $f),)+);
+        registry.bootstrap().map(|()| handles)
+    }};
+}
+
 /// What a task function returns. Any error type works, `anyhow::Error`
 /// included, so a task body reads like any other fallible function.
 pub type TaskResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
