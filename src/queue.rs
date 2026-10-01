@@ -53,7 +53,7 @@ impl State {
 
 impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -183,6 +183,20 @@ impl Level {
             "info" => Level::Info,
             _ => Level::Warn,
         }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Level::Info => "info",
+            Level::Warn => "warn",
+            Level::Error => "error",
+        }
+    }
+}
+
+impl std::fmt::Display for Level {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
     }
 }
 

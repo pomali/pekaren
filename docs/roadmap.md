@@ -44,11 +44,13 @@ that has not started), and reclaiming a lease left by another host.
 - Samples are collected and rolled up already; what is missing is GPU
   utilisation and surfacing any of it.
 - Stall detection feeding the stuck-job path.
-- "estimated 20 min, took 90 min, averaged 1.2 of 8 cores" in `pec status`.
+- "estimated 20 min, took 90 min, averaged 1.2 of 8 cores" in `pec status`
+  (done: `pec status <id>` puts the declaration next to the profile).
 
 ## 6 — Surfaces
 
 - `pec submit / status / wait / logs / reap` (the CLI open question).
+  `pec status` has a table, a full view of one job, and `--json`.
 - The agent-facing skill, once the Rust API has settled.
 
 ## Parked

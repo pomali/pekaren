@@ -31,7 +31,7 @@ than left pending, failed leases are reclaimed, `wait` waits.
 - decisions written down in [`docs/adr/`](docs/adr/)
 
 Not built yet: the handoff — spawning the wake command when a barrier
-settles — and the profiling that `pec status` should show. See
+settles — and GPU utilisation in the profile `pec status` shows. See
 [`docs/roadmap.md`](docs/roadmap.md).
 
 With no daemon, someone has to be the worker. Either the submitting process
@@ -42,7 +42,13 @@ one:
 pec work          # run everything claimable, then stop
 pec wait j3       # block until these jobs settle
 pec reap          # reclaim rotted leases, kill orphans
+pec status        # one line per job; `pec status j3` for one in full
 ```
+
+`pec status --json` prints one JSON object per job instead — state, exit
+code, failure, dependencies, declared resources, timing, the command, log
+paths, the evaluation prompt, the profile and the events — for a script or
+an evaluator that should not parse the table.
 
 ## Shape of it
 
