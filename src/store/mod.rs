@@ -57,6 +57,17 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE jobs ADD COLUMN pin_repo TEXT;
      ALTER TABLE jobs ADD COLUMN pin_commit TEXT;
      ALTER TABLE jobs ADD COLUMN pin_dir TEXT;",
+    // v4 -> v5: who submitted the work, and waking them.
+    "CREATE TABLE sessions (
+       id         TEXT PRIMARY KEY,
+       socket     TEXT,
+       cwd        TEXT,
+       host       TEXT,
+       first_seen INTEGER NOT NULL,
+       last_seen  INTEGER NOT NULL
+     ) WITHOUT ROWID;
+     ALTER TABLE jobs ADD COLUMN submitter TEXT REFERENCES sessions (id);
+     ALTER TABLE wakes ADD COLUMN target TEXT;",
 ];
 
 /// Unix millis, the store's one time unit.
@@ -329,6 +340,32 @@ impl Store {
             }
         }
 
+        // Who submitted this, so a wake can reach them. Identity only;
+        // see crate::Submitter for what is deliberately not recorded.
+        if let Some(who) = crate::Submitter::from_env() {
+            tx.execute(
+                "INSERT INTO sessions (id, socket, cwd, host, first_seen, last_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                 ON CONFLICT (id) DO UPDATE SET
+                     socket = excluded.socket,
+                     cwd = excluded.cwd,
+                     last_seen = excluded.last_seen",
+                params![
+                    who.session,
+                    who.socket
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    who.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    crate::worker::hostname(),
+                    now_ms(),
+                ],
+            )?;
+            tx.execute(
+                "UPDATE jobs SET submitter = ?2 WHERE id = ?1",
+                params![id.get(), who.session],
+            )?;
+        }
+
         for (pos, arg) in job.task_args.iter().enumerate() {
             tx.execute(
                 "INSERT INTO task_args (job_id, pos, arg) VALUES (?1, ?2, ?3)",
@@ -373,6 +410,9 @@ impl Store {
         match &job.wake {
             Wake::Nothing => {}
             Wake::Always(cmd) => insert_wake(&tx, id, "always", None, cmd)?,
+            Wake::Submitter { cold } => {
+                insert_wake_to(&tx, id, "always", None, cold, Some("submitter"))?
+            }
             Wake::ByWarmth {
                 warm,
                 cold,
@@ -471,17 +511,27 @@ impl Store {
              WHERE job_id = ?1 AND finished_at IS NOT NULL
              ORDER BY n DESC LIMIT 1",
         )?;
-        stmt.query_row([id.get()], |r| {
-            Ok(Profile {
-                wall: Duration::from_secs_f64(r.get::<_, Option<f64>>(0)?.unwrap_or(0.0)),
-                peak_rss_mb: r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
-                avg_cores: r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-                gpu_util_avg: r.get::<_, Option<f64>>(3)?,
-                gpu_util_peak: r.get::<_, Option<f64>>(4)?,
-                idle_fraction: r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+        let profile = stmt
+            .query_row([id.get()], |r| {
+                let peak_rss_mb: Option<i64> = r.get(1)?;
+                let avg_cores: Option<f64> = r.get(2)?;
+                // A job too short to sample has no profile. Reporting it as
+                // "0.0 of 8 cores, peak 0 MB" would read as a finding about
+                // the job rather than about the sampler.
+                if peak_rss_mb.is_none() && avg_cores.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Profile {
+                    wall: Duration::from_secs_f64(r.get::<_, Option<f64>>(0)?.unwrap_or(0.0)),
+                    peak_rss_mb: peak_rss_mb.unwrap_or(0) as u64,
+                    avg_cores: avg_cores.unwrap_or(0.0),
+                    gpu_util_avg: r.get::<_, Option<f64>>(3)?,
+                    gpu_util_peak: r.get::<_, Option<f64>>(4)?,
+                    idle_fraction: r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                }))
             })
-        })
-        .optional()
+            .optional()?;
+        Ok(profile.flatten())
     }
 
     /// The command a job runs, reassembled from its rows.
@@ -521,6 +571,27 @@ impl Store {
             cwd: cwd.map(PathBuf::from),
             env,
         }))
+    }
+
+    /// The session a job was submitted from, if any, as it was recorded.
+    pub(crate) fn submitter_of(&self, id: JobId) -> Result<Option<crate::Submitter>> {
+        let who = self
+            .conn
+            .query_row(
+                "SELECT s.id, s.socket, s.cwd
+                 FROM jobs j JOIN sessions s ON s.id = j.submitter
+                 WHERE j.id = ?1",
+                [id.get()],
+                |r| {
+                    Ok(crate::Submitter {
+                        session: r.get(0)?,
+                        socket: r.get::<_, Option<String>>(1)?.map(PathBuf::from),
+                        cwd: r.get::<_, Option<String>>(2)?.map(PathBuf::from),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(who)
     }
 
     /// The arguments a task job was submitted with.
@@ -1021,6 +1092,7 @@ impl Store {
             program: String,
             cwd: Option<String>,
             reclaimed: bool,
+            target: Option<String>,
             state: String,
             eval_prompt: Option<String>,
             finished_at: Option<i64>,
@@ -1028,7 +1100,7 @@ impl Store {
 
         let mut stmt = tx.prepare(
             "SELECT w.id, w.job_id, w.trigger, w.warm_until, w.shell, w.program, w.cwd,
-                    w.claimed_by IS NOT NULL, j.state, j.eval_prompt, j.finished_at
+                    w.claimed_by IS NOT NULL, w.target, j.state, j.eval_prompt, j.finished_at
              FROM wakes w JOIN jobs j ON j.id = w.job_id
              WHERE j.state IN ('done', 'failed', 'cancelled')
                AND w.fulfilled_at IS NULL
@@ -1046,9 +1118,10 @@ impl Store {
                     program: r.get(5)?,
                     cwd: r.get(6)?,
                     reclaimed: r.get(7)?,
-                    state: r.get(8)?,
-                    eval_prompt: r.get(9)?,
-                    finished_at: r.get(10)?,
+                    target: r.get(8)?,
+                    state: r.get(9)?,
+                    eval_prompt: r.get(10)?,
+                    finished_at: r.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1083,6 +1156,10 @@ impl Store {
                 state: State::from_db(&d.state),
                 eval_prompt: d.eval_prompt,
                 recovered: d.reclaimed,
+                // Resolved by the caller, now: whether the submitting
+                // session is still listening is only true or false at the
+                // moment of waking.
+                to_submitter: d.target.as_deref() == Some("submitter"),
                 command: Command {
                     program: d.program,
                     args,
@@ -1162,9 +1239,13 @@ pub(crate) struct WakeClaim {
     pub job: JobId,
     pub state: State,
     pub eval_prompt: Option<String>,
+    /// What to run, or the fallback when the wake is aimed at the
+    /// submitting session and that session cannot be reached.
     pub command: Command,
     /// Someone claimed it before and never spawned it.
     pub recovered: bool,
+    /// The wake is aimed at whoever submitted the job.
+    pub to_submitter: bool,
 }
 
 /// A child that may still be running with nobody supervising it.
@@ -1301,9 +1382,20 @@ fn insert_wake(
     warm_until: Option<i64>,
     cmd: &Command,
 ) -> Result<()> {
+    insert_wake_to(tx, job, trigger, warm_until, cmd, None)
+}
+
+fn insert_wake_to(
+    tx: &rusqlite::Transaction<'_>,
+    job: JobId,
+    trigger: &str,
+    warm_until: Option<i64>,
+    cmd: &Command,
+    target: Option<&str>,
+) -> Result<()> {
     tx.execute(
-        "INSERT INTO wakes (job_id, trigger, warm_until, shell, program, cwd)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO wakes (job_id, trigger, warm_until, shell, program, cwd, target)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             job.get(),
             trigger,
@@ -1311,6 +1403,7 @@ fn insert_wake(
             cmd.shell as i64,
             cmd.program,
             cmd.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            target,
         ],
     )?;
     let wake_id = tx.last_insert_rowid();

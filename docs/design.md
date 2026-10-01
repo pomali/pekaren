@@ -129,6 +129,15 @@ start is recorded as an error on the node, once, and not retried.
 
 The wake-up policy is a per-job or per-barrier knob, not a fixed rule.
 
+**Reaching the submitting session.** A job submitted from a Claude Code
+session records that session's id and inbox socket — never its messaging
+token — from the environment, so the handoff can aim at it. When the node
+settles, pekáreň resolves in order: a configured notifier, while the
+session still accepts a connection on its socket; otherwise resuming that
+session; otherwise the fallback command. What it carries is the outcome,
+the evaluation prompt, and what each dependency did against what it
+declared.
+
 ## Failure and restart
 
 Pekáreň guarantees exactly-once commits: a job's result is recorded by one

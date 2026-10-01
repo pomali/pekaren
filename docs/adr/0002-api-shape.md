@@ -210,6 +210,27 @@ complete system on its own. It also means a script that submits and exits
 leaves its jobs for the next worker — `pec work`, or the next script — which
 is what daemon-free costs.
 
+### A wake aimed at a session resolves late, and posts through a notifier
+
+`Wake::Submitter { cold }` records nothing but identity at submit time and
+decides what to run when the node settles, because the thing it depends on
+— whether that session is still listening — is only true or false at the
+moment of waking.
+
+Posting to the inbox socket is delegated to `PEKAREN_WAKE_NOTIFIER` rather
+than done here. The auth line's format is documented; the message line's is
+not. Implementing a guess would mean wakes that the store records as
+spawned and that no session ever reads, which is worse than the honest
+fallback of resuming the session with a documented flag. When the format is
+published, the posting moves inside and the notifier becomes an override.
+
+Identity is read from the environment (`CLAUDE_CODE_SESSION_ID`,
+`CLAUDE_CODE_MESSAGING_SOCKET`) rather than from a `SessionStart` hook,
+which is what an earlier note proposed: a submitting script already runs
+inside the session, so the hook would only tell us what we can see. The
+messaging token is never recorded — on macOS and Linux the auth line is
+optional, so storing secrets would buy nothing.
+
 ## Consequences
 
 - `Queue` is `Send` but not `Sync` (it holds one `rusqlite::Connection`).

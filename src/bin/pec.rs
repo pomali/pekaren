@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pekaren::{
     Command, FailurePolicy, Filter, Job, JobId, JobStatus, KillAfter, OnChange, Pin, Queue,
-    QueueOptions, State, default_store_path,
+    QueueOptions, State, Wake, default_store_path,
 };
 
 const USAGE: &str = "\
@@ -35,6 +35,7 @@ usage:
     pec [--store <dir>] cancel <job-id>...
     pec [--store <dir>] runnable
     pec [--store <dir>] check [<job-id>]
+    pec [--store <dir>] wake-message <job-id>
     pec [--store <dir>] reap
     pec [--store <dir>] where
 
@@ -60,6 +61,9 @@ program and its arguments instead, with no shell. Options:
                         --idempotent
     --idempotent        safe to run again after a lost lease
     --on-done <command> a shell line to spawn once it settles
+    --on-done-session <command>
+                        wake the session that submitted this instead, and
+                        spawn <command> only if it cannot be reached
     --exec              no shell: the first word is the program
     --pin [<rev>]       run in a checkout of this commit (default HEAD) of
                         the repository it runs in, not in the working tree
@@ -74,8 +78,21 @@ under WSL.
 
 an --on-done line (on a job or a barrier) is spawned once, by whichever
 worker sees the node settle, in the directory pec was called from, with
-PEKAREN_JOB, PEKAREN_STATE and PEKAREN_EVAL_PROMPT set; its output goes to
-logs/<n>/wake.out and wake.err in the store.
+PEKAREN_JOB, PEKAREN_STATE, PEKAREN_EVAL_PROMPT and PEKAREN_WAKE_MESSAGE
+set; its output goes to logs/<n>/wake.out and wake.err in the store.
+`pec wake-message` prints that message for a job, which is also what an
+--on-done-session wake carries.
+
+--on-done-session aims the wake at the Claude Code session that submitted
+the job, recorded from CLAUDE_CODE_SESSION_ID and
+CLAUDE_CODE_MESSAGING_SOCKET at submit time (never the messaging token).
+When it settles, in order: $PEKAREN_WAKE_NOTIFIER, if set and that session
+is still listening on its socket, with PEKAREN_WAKE_SOCKET,
+PEKAREN_WAKE_SESSION and PEKAREN_WAKE_MESSAGE in its environment;
+otherwise `$PEKAREN_CLAUDE --resume <session> -p <message>`, which reaches
+the session whether or not it is still open; otherwise the fallback
+command. Posting to the socket is left to the notifier because the auth
+line is documented and the message line is not.
 
 work runs jobs one at a time until nothing is claimable, or with --once
 just one. With --forever it stays up, looking at the store every --idle
@@ -367,6 +384,18 @@ fn run() -> Result<ExitCode> {
                 ExitCode::FAILURE
             });
         }
+        // What a wake would say about this job: the outcome, the eval
+        // prompt, what each dependency did and cost, and where the logs
+        // are. The same text an --on-done command gets in its
+        // environment.
+        "wake-message" => {
+            let q = open()?;
+            let id = match args.next() {
+                Some(id) => parse_id(&id)?,
+                None => return usage("wake-message takes a job id"),
+            };
+            print!("{}", q.wake_message(id)?);
+        }
         "reap" => {
             let q = open()?;
             let report = q.reap()?;
@@ -422,6 +451,7 @@ fn parse_submit(words: Vec<String>) -> Result<Job> {
     let mut retries = None;
     let mut idempotent = false;
     let mut on_done = None;
+    let mut on_done_session = None;
     let mut pin = None;
     let mut allow_dirty = false;
 
@@ -467,6 +497,7 @@ fn parse_submit(words: Vec<String>) -> Result<Job> {
             "--eval" => eval = Some(value()?.to_string()),
             "--retries" => retries = Some(number(flag, value()?)?),
             "--on-done" => on_done = Some(value()?.to_string()),
+            "--on-done-session" => on_done_session = Some(value()?.to_string()),
             // The revision is optional: `--pin` alone is HEAD.
             "--pin" => {
                 let rev = match flags.as_slice().first() {
@@ -533,6 +564,9 @@ fn parse_submit(words: Vec<String>) -> Result<Job> {
     if idempotent {
         job = job.idempotent(true);
     }
+    if let Some(line) = on_done_session {
+        job = job.on_done(Wake::submitter(wake(&line)?));
+    }
     if let Some(line) = on_done {
         job = job.on_done(wake(&line)?);
     }
@@ -563,6 +597,7 @@ fn parse_barrier(words: Vec<String>) -> Result<Job> {
             "--name" => job = job.name(value()?),
             "--eval" => job = job.eval_prompt(value()?),
             "--on-done" => job = job.on_done(wake(value()?)?),
+            "--on-done-session" => job = job.on_done(Wake::submitter(wake(value()?)?)),
             "--fail-at-end" => job = job.policy(FailurePolicy::FailAtEnd),
             other => return usage(format!("barrier does not take {other}")),
         }

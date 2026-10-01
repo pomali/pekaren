@@ -181,6 +181,22 @@ pub enum Wake {
         cold: Command,
         warm_until: SystemTime,
     },
+    /// Wake the session that submitted the job, and fall back to `cold`.
+    ///
+    /// Resolved when the node settles, not now, because what has changed by
+    /// then is the thing worth checking: a session still listening on its
+    /// inbox is the cheapest wake there is, since its context never went
+    /// away. See [`Submitter`](crate::Submitter) for what is recorded and
+    /// what deliberately is not.
+    Submitter { cold: Command },
+}
+
+impl Wake {
+    /// Wake the submitting session when the node settles, or run `cold` if
+    /// nothing was submitted from a session.
+    pub fn submitter(cold: impl Into<Command>) -> Wake {
+        Wake::Submitter { cold: cold.into() }
+    }
 }
 
 impl From<Command> for Wake {

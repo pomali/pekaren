@@ -32,11 +32,11 @@ than left pending, failed leases are reclaimed, `wait` waits.
 
 When a node with an `on_done` command settles, the worker that noticed
 spawns it — exactly once, however many workers share the store — with
-`PEKAREN_JOB`, `PEKAREN_STATE` and `PEKAREN_EVAL_PROMPT` set, and its
-output in `logs/<n>/wake.{out,err}`.
+`PEKAREN_JOB`, `PEKAREN_STATE`, `PEKAREN_EVAL_PROMPT` and
+`PEKAREN_WAKE_MESSAGE` set, and its output in `logs/<n>/wake.{out,err}`.
 
-Not built yet: GPU utilisation in the profile `pec status` shows, and a
-wake that knows whether its session is still alive. See
+Not built yet: GPU utilisation in the profile `pec status` shows, and
+posting into a live session's inbox without a notifier. See
 [`docs/roadmap.md`](docs/roadmap.md).
 
 With no daemon, someone has to be the worker. Either the submitting process
@@ -153,6 +153,47 @@ there is no project scaffolding. Loops and fan-outs are ordinary code — collec
 handles into a `Vec`, then submit one barrier that depends on all of them.
 See [`examples/sweep.rs`](examples/sweep.rs).
 
+## Waking whoever submitted it
+
+The cheapest listener for a finished job is the session that submitted it,
+still open: its context never went away, so waking it costs nothing new.
+
+```rust
+q.submit(Job::barrier().after(&runs).on_done(Wake::submitter("pec-evaluate --sweep lr")))?;
+```
+
+```
+pec barrier --after j1,j2 --on-done-session "pec-evaluate --sweep lr"
+```
+
+A job submitted from a Claude Code session records that session's id and
+inbox socket from the environment — never its messaging token. When the
+node settles, the wake resolves in order:
+
+| Rung | When |
+| --- | --- |
+| `$PEKAREN_WAKE_NOTIFIER` with `PEKAREN_WAKE_SOCKET`, `PEKAREN_WAKE_SESSION`, `PEKAREN_WAKE_MESSAGE` | the socket still accepts a connection and a notifier is configured |
+| `$PEKAREN_CLAUDE --resume <session> -p <message>` | otherwise — it reaches the session open or not |
+| the fallback command above | nothing was submitted from a session |
+
+Posting to the socket is left to a notifier because the auth line's format
+is documented and the message line's is not; a wake that looks delivered
+and is not would be worse than no wake. Liveness is a connect probe, since
+a socket file outlives its session.
+
+What any of them carries is `pec wake-message <job>`:
+
+```
+j3 barrier "sweep" done
+eval: Pick the run with the lowest final loss
+dependencies:
+  j1 train lr=1e-3 done exit 0 in 38m2s (declared 40m0s), 1.2 of 8 cores, peak 14336 MB
+  j2 train lr=3e-4 failed exit 1 in 2m3s
+notes:
+  Warn: input data/train changed since submit
+logs: /home/you/.pekaren/logs/3
+```
+
 ## What a job assumed
 
 A job submitted now may run in an hour, by which time the code and the data
@@ -212,6 +253,7 @@ beyond a C compiler.
 | --- | --- |
 | `src/job.rs` | `Job` builder, `Command`, `Resources`, `Wake`, policies |
 | `src/task.rs` | tasks: jobs that are functions in the submitting binary |
+| `src/session.rs` | the submitting session, and whether it is still listening |
 | `src/hash.rs` | change detection for the paths a job depends on |
 | `src/pin.rs` | commit pinning: the one place pekaren talks to git |
 | `src/queue.rs` | `Queue`, `JobStatus`, `State`, submit and read paths |

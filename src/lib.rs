@@ -45,6 +45,7 @@ mod job;
 mod pin;
 mod profile;
 mod queue;
+mod session;
 mod store;
 mod task;
 mod worker;
@@ -61,6 +62,7 @@ pub use queue::{
     Drift, DriftKind, Event, Filter, JobStatus, Level, Logs, Queue, QueueOptions, ReapReport,
     State, default_store_path,
 };
+pub use session::Submitter;
 pub use task::{JobCtx, Task, TaskFn, TaskResult, Tasks};
 pub use worker::{Capacity, Worker, WorkerReport};
 
@@ -76,4 +78,4 @@ pub mod prelude {
 
 /// Schema version this build speaks. A store written by a newer build is
 /// refused rather than migrated backwards.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;

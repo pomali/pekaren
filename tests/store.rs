@@ -118,7 +118,7 @@ fn opens_a_store_written_by_an_older_schema() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("store.db");
 
-    // Build a v1 store by hand: strip everything v2, v3 and v4 added.
+    // Build a v1 store by hand: strip everything v2 through v5 added.
     {
         let q = Queue::options()
             .work_on_submit(false)
@@ -134,6 +134,9 @@ fn opens_a_store_written_by_an_older_schema() {
              ALTER TABLE jobs DROP COLUMN pin_repo;
              ALTER TABLE jobs DROP COLUMN pin_commit;
              ALTER TABLE jobs DROP COLUMN pin_dir;
+             ALTER TABLE jobs DROP COLUMN submitter;
+             ALTER TABLE wakes DROP COLUMN target;
+             DROP TABLE sessions;
              DROP TABLE task_args;
              DROP TABLE job_inputs;
              DROP TABLE job_events;

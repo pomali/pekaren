@@ -111,6 +111,46 @@ Note that `--bare` does not read OAuth credentials, so it needs
 - **Scheduled tasks** poll on a timer. That is the thing pekáreň is supposed
   to remove.
 
+## What we ended up building
+
+`Job::on_done(Wake::submitter(fallback))`, or `pec --on-done-session`.
+
+**Identity comes from the environment, not a hook.** Claude Code exports
+`CLAUDE_CODE_SESSION_ID` and `CLAUDE_CODE_MESSAGING_SOCKET` to every command
+it runs, so a submitting script already knows who it is. Pekáreň reads both
+at submit time into a `sessions` table and records **never** the
+`CLAUDE_CODE_MESSAGING_TOKEN`: on macOS and Linux the auth line it signs is
+optional, and a store full of session tokens is a liability out of all
+proportion to what it buys. The `SessionStart` hook this note originally
+called for turned out to be unnecessary.
+
+**The ladder, resolved when the node settles** — not at submit, because
+liveness is only true or false at the moment of waking:
+
+1. The socket still accepts a connection, and `PEKAREN_WAKE_NOTIFIER` is
+   set: that command runs with `PEKAREN_WAKE_SOCKET`,
+   `PEKAREN_WAKE_SESSION` and `PEKAREN_WAKE_MESSAGE` in its environment.
+2. Otherwise `$PEKAREN_CLAUDE --resume <session> -p <message>`, which
+   reaches the session whether or not it is still open.
+3. No session recorded: the fallback command the job carried.
+
+**Why a notifier rather than posting ourselves.** The auth line's format is
+documented; the format of the *message* line is not. Pekáreň carries the
+socket path to something that knows, instead of guessing a wire format that
+would fail silently — a wake that looks delivered and is not is worse than
+no wake. If the format gets published, the posting moves inside and rung 1
+loses its `PEKAREN_WAKE_NOTIFIER` condition.
+
+**Liveness is a connect probe**, not a file-exists check: a socket file
+outlives its session, which is exactly the case that has to be caught. The
+probe connects and hangs up without writing, so nothing is delivered.
+
+**What the wake carries** is `pec wake-message <job>`: the outcome, the
+evaluation prompt written at submit time, what each dependency did and cost
+against what it declared, anything noticed along the way, and where the
+logs are. Every wake gets it in `PEKAREN_WAKE_MESSAGE`, so a relay script
+needs no access to the store.
+
 ## What this says about the design
 
 **Cache-warm detection** is an open question in the design doc. Nothing here
@@ -130,12 +170,8 @@ Which maps onto `Wake::ByWarmth { warm, cold, warm_until }` with one change:
 the warm branch should be conditional on liveness, not only on a deadline
 written at submit time.
 
-**How pekáreň learns the socket and session id.** A `SessionStart` hook,
-shipped with the crate, writing `session_id`, `CLAUDE_CODE_MESSAGING_SOCKET`
-and `cwd` into the store — one row per live session, refreshed on every
-start and resume. That gives `Job::on_done` something to name, and gives
-`pec` a way to list who can be woken. It needs a `sessions` table and a
-schema bump; not built yet.
+**How pekáreň learns the socket and session id.** From its own
+environment, at submit time — see above. No hook needed.
 
 ## Sources
 

@@ -30,9 +30,13 @@ that has not started), and reclaiming a lease left by another host.
   claim is picked up by the next process to touch the store (done: a claim
   older than a minute is taken over by the next worker or `reap`).
 - Spawning the stored wake command, `ByWarmth` included (done).
-- A `sessions` table and a `SessionStart` hook, so a wake can reach the
-  session that submitted the work: see
+- Reaching the session that submitted the work (done): identity is read
+  from `CLAUDE_CODE_SESSION_ID` and `CLAUDE_CODE_MESSAGING_SOCKET` at
+  submit, so no hook is needed, and `Wake::submitter` resolves notifier →
+  resume → fallback when the node settles. See
   [`notes/waking-claude-code.md`](notes/waking-claude-code.md).
+- Left over: posting to a live session's inbox ourselves, once the
+  message line's format is published; today a notifier command does it.
 
 ## 4 — Reaping and stuck jobs
 

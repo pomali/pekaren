@@ -584,7 +584,12 @@ fn process_for(cmd: &crate::job::Command) -> std::process::Command {
 /// It learns what settled from `PEKAREN_JOB`, `PEKAREN_STATE` and
 /// `PEKAREN_EVAL_PROMPT`. A thread waits on it, so a worker that stays up
 /// for days does not collect zombies.
-pub(crate) fn spawn_wake(store: &Path, logs: &Path, claim: &WakeClaim) -> Result<u32> {
+pub(crate) fn spawn_wake(
+    store: &Path,
+    logs: &Path,
+    claim: &WakeClaim,
+    message: &str,
+) -> Result<u32> {
     std::fs::create_dir_all(logs).map_err(|e| Error::io(logs, e))?;
     let out = std::fs::File::create(logs.join("wake.out")).map_err(|e| Error::io(logs, e))?;
     let err = std::fs::File::create(logs.join("wake.err")).map_err(|e| Error::io(logs, e))?;
@@ -594,6 +599,9 @@ pub(crate) fn spawn_wake(store: &Path, logs: &Path, claim: &WakeClaim) -> Result
         .env(crate::task::JOB_ENV, claim.job.to_string())
         .env("PEKAREN_STATE", claim.state.to_string())
         .env("PEKAREN_STORE", store)
+        // Everything the wake needs to say, composed once: a script that
+        // only has to relay it does not have to query the store at all.
+        .env("PEKAREN_WAKE_MESSAGE", message)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));

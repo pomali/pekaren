@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::error::{Error, Result};
 use crate::id::JobId;
-use crate::job::{InputKind, Job, OnChange, Resources};
+use crate::job::{Command, InputKind, Job, OnChange, Resources};
 use crate::profile::Profile;
 use crate::store::Store;
 
@@ -547,6 +547,59 @@ impl Queue {
         Ok(report)
     }
 
+    /// The session a job was submitted from, as it was recorded.
+    pub fn submitter(&self, id: JobId) -> Result<Option<crate::Submitter>> {
+        self.store.submitter_of(id)
+    }
+
+    /// What a wake has to say about a settled node: the outcome, the
+    /// evaluation prompt written at submit time, what each dependency did
+    /// and cost, anything noticed along the way, and where the output is.
+    ///
+    /// This is the whole point of the handoff — a fresh evaluator reads it
+    /// instead of the submitting agent's context, and the submitting agent,
+    /// if it is still there, reads it instead of re-deriving the sweep.
+    pub fn wake_message(&self, id: JobId) -> Result<String> {
+        let status = self.status(id)?;
+        let what = if status.is_barrier { "barrier" } else { "job" };
+        let name = status
+            .name
+            .clone()
+            .map(|n| format!(" \"{n}\""))
+            .unwrap_or_default();
+        let mut out = format!("{id} {what}{name} {}", status.state);
+        if let Some(code) = status.exit_code {
+            out.push_str(&format!(" (exit {code})"));
+        }
+        if let Some(took) = elapsed(&status) {
+            out.push_str(&format!(" in {}", duration(took)));
+        }
+        out.push('\n');
+
+        if let Some(prompt) = &status.eval_prompt {
+            out.push_str(&format!("eval: {prompt}\n"));
+        }
+
+        if !status.deps.is_empty() {
+            out.push_str("dependencies:\n");
+            for dep in &status.deps {
+                let d = self.status(*dep)?;
+                out.push_str(&format!("  {}\n", dep_line(&d)));
+            }
+        }
+
+        let events = self.events(id)?;
+        if !events.is_empty() {
+            out.push_str("notes:\n");
+            for event in &events {
+                out.push_str(&format!("  {:?}: {}\n", event.level, event.message));
+            }
+        }
+
+        out.push_str(&format!("logs: {}\n", self.store.log_dir(id).display()));
+        Ok(out)
+    }
+
     /// Spawn the wake command of every node that has settled and not had it
     /// spawned yet: the handoff. Of all the processes that sweep the store,
     /// exactly one spawns each wake, and one whose claimant died before
@@ -558,9 +611,15 @@ impl Queue {
     pub(crate) fn handoff(&self) -> Result<Vec<(JobId, bool)>> {
         let who = format!("{}-{}", crate::worker::hostname(), std::process::id());
         let mut spawned = Vec::new();
-        for claim in self.store.claim_wakes(&who, WAKE_STALE)? {
+        for mut claim in self.store.claim_wakes(&who, WAKE_STALE)? {
             let logs = self.store.log_dir(claim.job);
-            match crate::worker::spawn_wake(self.path(), &logs, &claim) {
+            let message = self.wake_message(claim.job)?;
+            let how = if claim.to_submitter {
+                self.aim_at_submitter(&mut claim, &message)?
+            } else {
+                "command"
+            };
+            match crate::worker::spawn_wake(self.path(), &logs, &claim, &message) {
                 Ok(pid) => {
                     self.store.fulfil_wake(&claim, Some(pid))?;
                     let note = if claim.recovered {
@@ -571,7 +630,7 @@ impl Queue {
                     self.store.record_event(
                         claim.job,
                         "info",
-                        &format!("wake spawned, pid {pid}{note}"),
+                        &format!("wake spawned via {how}, pid {pid}{note}"),
                     )?;
                     spawned.push((claim.job, claim.recovered));
                 }
@@ -589,6 +648,111 @@ impl Queue {
         }
         Ok(spawned)
     }
+
+    /// Point a wake at the session that submitted the job, and say which
+    /// rung of the ladder it ended up on.
+    ///
+    /// 1. The session is still listening and a notifier is configured:
+    ///    hand that notifier the socket and the message. The posting itself
+    ///    is the notifier's business — the auth line is documented, the
+    ///    message line is not, and pekáreň does not guess a wire format.
+    /// 2. A session id, whether or not it still listens: resume it, which
+    ///    is documented and works either way.
+    /// 3. Nothing recorded: the fallback command the job was submitted
+    ///    with.
+    fn aim_at_submitter(
+        &self,
+        claim: &mut crate::store::WakeClaim,
+        message: &str,
+    ) -> Result<&'static str> {
+        let Some(who) = self.store.submitter_of(claim.job)? else {
+            return Ok("fallback command, nothing was recorded about the submitter");
+        };
+
+        if who.is_live() {
+            if let Some(notifier) = notifier_command() {
+                claim.command = notifier
+                    .env("PEKAREN_WAKE_SOCKET", socket_of(&who))
+                    .env("PEKAREN_WAKE_SESSION", &who.session)
+                    .env("PEKAREN_WAKE_MESSAGE", message);
+                return Ok("the submitting session's inbox");
+            }
+        }
+
+        // `claude -p --resume <id>` reaches the session whether or not it
+        // is still open, and replays its transcript when it is not.
+        claim.command = Command::exec(
+            std::env::var("PEKAREN_CLAUDE").unwrap_or_else(|_| "claude".into()),
+            ["--resume", &who.session, "-p", message],
+        );
+        Ok(if who.is_live() {
+            "resuming the submitting session (no PEKAREN_WAKE_NOTIFIER set)"
+        } else {
+            "resuming the submitting session, which is no longer listening"
+        })
+    }
+}
+
+/// The command that posts into a live session's inbox, from
+/// `PEKAREN_WAKE_NOTIFIER`: a whitespace-separated command line that reads
+/// `PEKAREN_WAKE_SOCKET`, `PEKAREN_WAKE_SESSION` and
+/// `PEKAREN_WAKE_MESSAGE` from its environment.
+fn notifier_command() -> Option<Command> {
+    let line = std::env::var("PEKAREN_WAKE_NOTIFIER").ok()?;
+    let mut words = line.split_whitespace().map(str::to_owned);
+    let program = words.next()?;
+    Some(Command::exec(program, words.collect::<Vec<_>>()))
+}
+
+fn socket_of(who: &crate::Submitter) -> String {
+    who.socket
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// How long a job took, when it got as far as running.
+fn elapsed(status: &JobStatus) -> Option<Duration> {
+    let (start, end) = (status.started_at?, status.finished_at?);
+    end.duration_since(start).ok()
+}
+
+fn duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    match (secs / 3600, (secs % 3600) / 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m{s}s"),
+        (h, m, _) => format!("{h}h{m}m"),
+    }
+}
+
+/// One dependency, as a line an evaluator can act on: what it did, what it
+/// cost, and how that compares with what it claimed it would cost.
+fn dep_line(d: &JobStatus) -> String {
+    let name = d.name.clone().unwrap_or_default();
+    let mut line = format!("{} {name} {}", d.id, d.state);
+    if let Some(code) = d.exit_code {
+        line.push_str(&format!(" exit {code}"));
+    }
+    if let Some(took) = elapsed(d) {
+        line.push_str(&format!(" in {}", duration(took)));
+        if let Some(est) = d.resources.est {
+            line.push_str(&format!(" (declared {})", duration(est)));
+        }
+    }
+    if let Some(p) = &d.profile {
+        line.push_str(&format!(
+            ", {:.1} of {} cores, peak {} MB",
+            p.avg_cores, d.resources.cpus, p.peak_rss_mb
+        ));
+        if p.idle_fraction > 0.5 {
+            line.push_str(&format!(
+                ", idle {:.0}% of the time",
+                p.idle_fraction * 100.0
+            ));
+        }
+    }
+    line
 }
 
 /// How long a notification claim may stay unfulfilled before another

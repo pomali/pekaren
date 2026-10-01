@@ -1,4 +1,4 @@
--- pekaren store, schema v4.
+-- pekaren store, schema v5.
 --
 -- Every process that opens this file is a client and potentially a worker;
 -- there is no daemon and no single writer. Three rules follow from that and
@@ -33,6 +33,9 @@ CREATE TABLE jobs (
   -- The registered function a task job runs, inside the binary named by
   -- `program`. NULL for everything else.
   task_name      TEXT,
+  -- The session this job was submitted from, when there was one. What the
+  -- handoff wakes.
+  submitter      TEXT REFERENCES sessions (id),
   -- Pinned to a commit: the object store to fetch from, the full commit
   -- id, and the directory within the checkout to run in. The checkout
   -- (a lane under <store>/lanes, one per repository) is derived, and is
@@ -121,6 +124,9 @@ CREATE TABLE wakes (
   shell        INTEGER NOT NULL DEFAULT 1,
   program      TEXT NOT NULL,
   cwd          TEXT,
+  -- 'submitter' resolves to the submitting session when the node settles,
+  -- rather than running `program`; NULL means run the command as stored.
+  target       TEXT,
   claimed_by   TEXT,
   claimed_at   INTEGER,
   fulfilled_at INTEGER,
@@ -191,6 +197,18 @@ CREATE TABLE hosts (
   mem_mb      INTEGER NOT NULL,
   gpu_devices TEXT NOT NULL DEFAULT '',  -- comma-separated device indices
   seen_at     INTEGER NOT NULL
+) WITHOUT ROWID;
+
+-- The sessions that have submitted work to this store. Identity only: the
+-- id to resume and the inbox to post to, never the messaging token, which
+-- would be a liability far out of proportion to what it buys.
+CREATE TABLE sessions (
+  id         TEXT PRIMARY KEY,
+  socket     TEXT,
+  cwd        TEXT,
+  host       TEXT,
+  first_seen INTEGER NOT NULL,
+  last_seen  INTEGER NOT NULL
 ) WITHOUT ROWID;
 
 -- Arguments for a task job. Separate from job_args, which is argv: a task
