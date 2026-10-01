@@ -881,52 +881,26 @@ impl Store {
         Ok(orphans)
     }
 
-    /// Settle every barrier whose dependencies have decided, applying its
-    /// failure policy. Returns the ones that changed state.
-    pub(crate) fn settle_barriers(&self) -> Result<Vec<(JobId, State)>> {
+    /// Settle everything whose dependencies have decided: every barrier, by
+    /// its failure policy, and every job that can now never run because a
+    /// dependency failed or was cancelled. Returns what changed state.
+    ///
+    /// A stranded job is cancelled rather than left pending, so a wait on it
+    /// returns. Cancelling one can settle a barrier behind it, and failing
+    /// that barrier can strand what follows, so this repeats until nothing
+    /// moves — all in one transaction, so no reader sees half a cascade.
+    pub(crate) fn settle(&self) -> Result<Vec<(JobId, State)>> {
         let tx = self.write_tx()?;
         let now = now_ms();
 
-        let mut stmt = tx.prepare(
-            "SELECT b.id, b.failure_policy,
-                    (SELECT COUNT(*) FROM deps d JOIN jobs p ON p.id = d.parent_id
-                      WHERE d.child_id = b.id AND p.state IN ('failed', 'cancelled')),
-                    (SELECT COUNT(*) FROM deps d JOIN jobs p ON p.id = d.parent_id
-                      WHERE d.child_id = b.id
-                        AND p.state NOT IN ('done', 'failed', 'cancelled'))
-             FROM jobs b
-             WHERE b.kind = 'barrier' AND b.state IN ('pending', 'ready')",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    JobId::new(r.get(0)?),
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-
         let mut settled = Vec::new();
-        for (id, policy, failed, unsettled) in rows {
-            let state = match (failed, unsettled, policy.as_str()) {
-                // Fail-fast notifies the moment a dependency fails; the
-                // rest of the subgraph keeps running but nobody waits on it.
-                (f, _, "fail_fast") if f > 0 => State::Failed,
-                (f, 0, _) if f > 0 => State::Failed,
-                (0, 0, _) => State::Done,
-                _ => continue,
-            };
-            tx.execute(
-                "UPDATE jobs SET state = ?2, finished_at = ?3,
-                     failure = CASE WHEN ?2 = 'failed'
-                         THEN 'a dependency failed' END
-                 WHERE id = ?1 AND state IN ('pending', 'ready')",
-                params![id.get(), state.as_str(), now],
-            )?;
-            settled.push((id, state));
+        loop {
+            let before = settled.len();
+            settle_barriers(&tx, now, &mut settled)?;
+            cancel_stranded(&tx, now, &mut settled)?;
+            if settled.len() == before {
+                break;
+            }
         }
 
         tx.commit()?;
@@ -1012,6 +986,109 @@ fn lease_token(host: &str) -> String {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// Settle every barrier whose dependencies have decided, applying its
+/// failure policy.
+fn settle_barriers(
+    tx: &rusqlite::Transaction<'_>,
+    now: i64,
+    settled: &mut Vec<(JobId, State)>,
+) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT b.id, b.failure_policy,
+                (SELECT COUNT(*) FROM deps d JOIN jobs p ON p.id = d.parent_id
+                  WHERE d.child_id = b.id AND p.state IN ('failed', 'cancelled')),
+                (SELECT COUNT(*) FROM deps d JOIN jobs p ON p.id = d.parent_id
+                  WHERE d.child_id = b.id
+                    AND p.state NOT IN ('done', 'failed', 'cancelled'))
+         FROM jobs b
+         WHERE b.kind = 'barrier' AND b.state IN ('pending', 'ready')",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                JobId::new(r.get(0)?),
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (id, policy, failed, unsettled) in rows {
+        let state = match (failed, unsettled, policy.as_str()) {
+            // Fail-fast notifies the moment a dependency fails; the
+            // rest of the subgraph keeps running but nobody waits on it.
+            (f, _, "fail_fast") if f > 0 => State::Failed,
+            (f, 0, _) if f > 0 => State::Failed,
+            (0, 0, _) => State::Done,
+            _ => continue,
+        };
+        tx.execute(
+            "UPDATE jobs SET state = ?2, finished_at = ?3,
+                 failure = CASE WHEN ?2 = 'failed'
+                     THEN 'a dependency failed' END
+             WHERE id = ?1 AND state IN ('pending', 'ready')",
+            params![id.get(), state.as_str(), now],
+        )?;
+        settled.push((id, state));
+    }
+    Ok(())
+}
+
+/// Cancel every job a failed or cancelled dependency has stranded: it can
+/// never become runnable, and left pending it would hold up anyone waiting
+/// on it for ever. The failure names the dependency, the lowest-numbered
+/// one when several went wrong. Barriers are not touched here; they settle
+/// by their own policy.
+fn cancel_stranded(
+    tx: &rusqlite::Transaction<'_>,
+    now: i64,
+    settled: &mut Vec<(JobId, State)>,
+) -> Result<()> {
+    // MIN() makes SQLite take the bare p.state from that same row.
+    let mut stmt = tx.prepare(
+        "SELECT j.id, MIN(p.id), p.state
+         FROM jobs j
+         JOIN deps d ON d.child_id = j.id
+         JOIN jobs p ON p.id = d.parent_id
+         WHERE j.kind = 'command' AND j.state IN ('pending', 'ready')
+           AND p.state IN ('failed', 'cancelled')
+         GROUP BY j.id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                JobId::new(r.get(0)?),
+                JobId::new(r.get(1)?),
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (id, parent, parent_state) in rows {
+        let why = match parent_state.as_str() {
+            "failed" => format!("dependency {parent} failed"),
+            _ => format!("dependency {parent} was cancelled"),
+        };
+        let changed = tx.execute(
+            "UPDATE jobs SET state = 'cancelled', finished_at = ?2, failure = ?3
+             WHERE id = ?1 AND state IN ('pending', 'ready')",
+            params![id.get(), now, why],
+        )?;
+        if changed == 1 {
+            tx.execute(
+                "INSERT INTO job_events (job_id, at, level, message)
+                 VALUES (?1, ?2, 'info', ?3)",
+                params![id.get(), now, format!("cancelled: {why}")],
+            )?;
+            settled.push((id, State::Cancelled));
+        }
+    }
+    Ok(())
 }
 
 fn insert_wake(

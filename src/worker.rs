@@ -108,7 +108,7 @@ impl<'q> Worker<'q> {
     /// Claim and run one job if anything is claimable right now. Returns
     /// `None` when nothing is.
     pub fn run_one(&mut self) -> Result<Option<JobId>> {
-        self.queue.store().settle_barriers()?;
+        self.queue.store().settle()?;
         let Some(claim) = self
             .queue
             .store()
@@ -118,7 +118,7 @@ impl<'q> Worker<'q> {
         };
         let id = claim.id;
         self.run_claim(claim)?;
-        self.queue.store().settle_barriers()?;
+        self.queue.store().settle()?;
         Ok(Some(id))
     }
 
@@ -157,7 +157,7 @@ impl<'q> Worker<'q> {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 break;
             }
-            self.queue.store().settle_barriers()?;
+            self.queue.store().settle()?;
 
             match self
                 .queue
@@ -171,7 +171,7 @@ impl<'q> Worker<'q> {
                         Committed::Failed => report.failed.push(id),
                         Committed::LostRace => report.lost_races += 1,
                     }
-                    self.queue.store().settle_barriers()?;
+                    self.queue.store().settle()?;
                 }
                 None if stop_when_idle => break,
                 None => std::thread::sleep(self.poll),

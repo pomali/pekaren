@@ -467,9 +467,9 @@ impl Queue {
     pub fn wait(&self, ids: &[JobId], timeout: Option<Duration>) -> Result<Vec<JobStatus>> {
         let deadline = timeout.map(|t| std::time::Instant::now() + t);
         loop {
-            // Barriers settle here too, so waiting on one works in a
-            // process that is not running any jobs itself.
-            self.store.settle_barriers()?;
+            // Barriers settle here too, and stranded jobs are cancelled, so
+            // waiting works in a process that is not running any jobs itself.
+            self.store.settle()?;
             let statuses = self.statuses(ids)?;
             if statuses.iter().all(|s| s.state.is_settled()) {
                 return Ok(statuses);
@@ -493,12 +493,13 @@ impl Queue {
         })
     }
 
-    /// Cancel a job that has not started. A running job is left alone:
-    /// stopping it is the supervising worker's business, through its cap
-    /// or its lease.
+    /// Cancel a job that has not started, and with it every job that
+    /// depended on it. A running job is left alone: stopping it is the
+    /// supervising worker's business, through its cap or its lease.
     pub fn cancel(&self, id: JobId) -> Result<()> {
         if self.store.cancel(id)? {
             self.store.record_event(id, "info", "cancelled")?;
+            self.store.settle()?;
         }
         Ok(())
     }
@@ -521,7 +522,7 @@ impl Queue {
                 }
             }
         }
-        self.store.settle_barriers()?;
+        self.store.settle()?;
         Ok(report)
     }
 }

@@ -97,6 +97,80 @@ fn a_barrier_settles_when_its_dependencies_do() {
 }
 
 #[test]
+fn a_failed_dependency_cancels_everything_downstream() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = queue(dir.path());
+    let marker = dir.path().join("ran");
+
+    let bad = q.submit(Job::cmd("exit 3")).unwrap();
+    let next = q
+        .submit(Job::cmd(format!("touch {}", marker.display())).after([bad]))
+        .unwrap();
+    let after_next = q.submit(Job::cmd("true").after([next])).unwrap();
+    let barrier = q.submit(Job::barrier().after([after_next])).unwrap();
+    let beyond = q.submit(Job::cmd("true").after([barrier])).unwrap();
+    let unrelated = q.submit(Job::cmd("true")).unwrap();
+
+    worker(&q).run_until_idle().unwrap();
+
+    // Nothing is left pending for ever, so a wait on any of it returns.
+    let settled = q
+        .wait(&[next, after_next, barrier, beyond], Some(Duration::ZERO))
+        .unwrap();
+    let states: Vec<State> = settled.iter().map(|s| s.state).collect();
+    assert_eq!(
+        states,
+        [
+            State::Cancelled,
+            State::Cancelled,
+            State::Failed,
+            State::Cancelled
+        ]
+    );
+    assert!(!marker.exists(), "a stranded job must not run");
+
+    // Each one says which dependency stranded it.
+    let s = q.status(next).unwrap();
+    assert_eq!(s.failure, Some(format!("dependency {bad} failed")));
+    assert_eq!(s.attempt, 0);
+    assert_eq!(
+        q.status(after_next).unwrap().failure,
+        Some(format!("dependency {next} was cancelled"))
+    );
+    assert_eq!(
+        q.status(beyond).unwrap().failure,
+        Some(format!("dependency {barrier} failed"))
+    );
+    assert!(
+        q.events(next)
+            .unwrap()
+            .iter()
+            .any(|e| e.message.contains("cancelled"))
+    );
+    assert_eq!(q.status(unrelated).unwrap().state, State::Done);
+}
+
+#[test]
+fn cancelling_a_job_cancels_what_depends_on_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = queue(dir.path());
+
+    let first = q.submit(Job::cmd("true")).unwrap();
+    let second = q.submit(Job::cmd("true").after([first])).unwrap();
+    let barrier = q
+        .submit(Job::barrier().after([second]).policy(FailAtEnd))
+        .unwrap();
+
+    q.cancel(first).unwrap();
+
+    // At once, with no worker and no wait in between.
+    assert_eq!(q.status(first).unwrap().state, State::Cancelled);
+    assert_eq!(q.status(second).unwrap().state, State::Cancelled);
+    assert_eq!(q.status(barrier).unwrap().state, State::Failed);
+    assert!(q.runnable().unwrap().is_empty());
+}
+
+#[test]
 fn a_job_that_will_not_end_is_killed_at_its_cap() {
     let dir = tempfile::tempdir().unwrap();
     let q = queue(dir.path());

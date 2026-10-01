@@ -24,6 +24,8 @@ that has not started), and reclaiming a lease left by another host.
 ## 3 — Handoff
 
 - Barrier settlement, both failure policies.
+- Jobs stranded by a failed or cancelled dependency are cancelled, so a
+  wait on them returns (done).
 - The notification claim: finishing workers race, one wins, an unfulfilled
   claim is picked up by the next process to touch the store.
 - Spawning the stored wake command, `ByWarmth` included.

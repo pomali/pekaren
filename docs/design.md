@@ -88,6 +88,12 @@ flowchart LR
 The tradeoff is wasted compute against wasted wake-ups. Fail-fast is the
 default because it is the safer surprise.
 
+A job, as opposed to a barrier, has no policy: one whose dependency failed
+or was cancelled can never run, so it is cancelled, with a failure naming
+the dependency, and whatever depends on it settles in turn. Left pending, it
+would hold up anyone waiting on it for ever. Cancelling a job by hand
+cascades the same way.
+
 ## Wake-up policy and handoff
 
 The last worker to finish a barrier's dependencies spawns whatever comes

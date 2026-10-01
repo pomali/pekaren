@@ -21,7 +21,8 @@ Full design: [`docs/design.md`](docs/design.md).
 
 Submitted work actually executes: a worker claims a job with a lease, runs
 it, samples it, and commits the result only while the lease still holds its
-token. Barriers settle, failed leases are reclaimed, `wait` waits.
+token. Barriers settle, a job whose dependency failed is cancelled rather
+than left pending, failed leases are reclaimed, `wait` waits.
 
 - the public API (`Queue`, `Job`, `JobId`, `Task`, `Wake`, `Worker`)
 - the SQLite schema, in [`src/store/schema.sql`](src/store/schema.sql)
