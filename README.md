@@ -55,6 +55,30 @@ code, failure, dependencies, declared resources, timing, the command, log
 paths, the evaluation prompt, the profile and the events — for a script or
 an evaluator that should not parse the table.
 
+## From a shell
+
+Everything a submitting script can say, `pec submit` takes as flags, and it
+prints the new id:
+
+```
+T=$(pec submit --name train --gpus 1 --cpus 24 --est 40m --cap 90m \
+      --env LR=3e-4 --watch data/train --eval "Loss should drop below 0.3" \
+      -- python train.py --lr '$LR')
+V=$(pec submit --name eval --after $T --cpus 4 -- python eval.py)
+W=$(pec barrier --after $T,$V --on-done 'notify-send "sweep settled"')
+pec wait --timeout 1h $W; echo $?     # 0, 1 or 124
+pec logs $T                           # its stdout; --err for stderr
+```
+
+The words after `--` are one shell line, run through `sh -c` in the
+directory `pec` was called from (`--cwd` to change it; `--exec` to run them
+as a program and arguments with no shell). `--env-pass NAME` copies a
+variable from the submitting shell, since the worker that runs the job has
+an environment of its own; `--watch` paths are made absolute for the same
+reason. `--retries N` implies the job is safe to run twice. `pec cancel`
+stops jobs that have not started, and everything behind them. `pec help`
+lists every flag.
+
 ## Shape of it
 
 ```rust

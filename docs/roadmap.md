@@ -49,8 +49,10 @@ that has not started), and reclaiming a lease left by another host.
 
 ## 6 — Surfaces
 
-- `pec submit / status / wait / logs / reap` (the CLI open question).
-  `pec status` has a table, a full view of one job, and `--json`.
+- `pec submit / status / wait / logs / reap` (the CLI open question):
+  done, with `pec barrier` and `pec cancel`. `pec status` has a table, a
+  full view of one job, and `--json`; `pec wait` has a timeout and exit
+  codes.
 - The agent-facing skill, once the Rust API has settled.
 
 ## Parked

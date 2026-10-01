@@ -204,9 +204,11 @@ same samples feed the stall detection above.
 
 ## Open questions
 
-- **CLI surface.** Deferred. Sketch so far: `pec submit` (command, resources,
-  deps, eval prompt; prints a `JobId`), `pec status`, `pec wait`, `pec logs`,
-  `pec reap`, all on the same store.
+- **CLI surface.** `pec submit` (command, resources, deps, eval prompt;
+  prints a `JobId`), `pec barrier`, `pec status`, `pec wait`, `pec logs`,
+  `pec cancel` and `pec reap` exist, all on the same store, each a few calls
+  into `Queue`. Open: whether `pec submit` should offer the grace window,
+  which needs the `pec` process to stay and work.
 - **Multi-node.** A shared filesystem stretches the SQLite store to several
   nodes, but locking over network filesystems is unreliable. Likely needs a
   tiny optional server later.

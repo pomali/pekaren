@@ -1,43 +1,75 @@
 //! `pec` — the oven. A thin window onto a store.
 //!
-//! The full CLI is deferred (see the design doc's open questions): the shape
-//! so far is `submit`, `status`, `wait`, `logs`, `reap`, all on the same
-//! store as the library. What exists today is the read side, enough to look
-//! at a store a script created.
+//! Everything a script can do through the library that a shell also needs:
+//! submit a command or a barrier, read and wait on what happened, run a
+//! worker. Thin on purpose — each subcommand is a few calls into `Queue` —
+//! so the library stays the one place the behaviour lives.
 //!
 //! Every subcommand opens the default store — `$PEKAREN_STORE`, else
 //! `~/.pekaren` — unless `--store` says otherwise.
 
 use std::fmt::Write as _;
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use pekaren::{Filter, JobId, JobStatus, Queue, QueueOptions, State, default_store_path};
+use pekaren::{
+    Command, FailurePolicy, Filter, Job, JobId, JobStatus, KillAfter, OnChange, Queue,
+    QueueOptions, State, default_store_path,
+};
 
 const USAGE: &str = "\
 pec — pekáreň's oven
 
 usage:
+    pec [--store <dir>] submit [<options>] -- <command>...
+    pec [--store <dir>] barrier --after <ids> [--name <n>] [--eval <text>]
+                                [--on-done <command>] [--fail-at-end]
     pec [--store <dir>] work [--once]
     pec [--store <dir>] status [--json] [<job-id>...]
+    pec [--store <dir>] wait [--timeout <secs>] [--json] <job-id>...
+    pec [--store <dir>] logs [--err] [--path] <job-id>
+    pec [--store <dir>] cancel <job-id>...
     pec [--store <dir>] runnable
     pec [--store <dir>] check [<job-id>]
-    pec [--store <dir>] wait [--timeout <secs>] [--json] <job-id>...
     pec [--store <dir>] reap
     pec [--store <dir>] where
 
 the store defaults to $PEKAREN_STORE, else ~/.pekaren.
 
+submit prints the new job's id. The words after -- are one shell line
+(sh -c), run in the directory pec was called from; --exec runs them as a
+program and its arguments instead, with no shell. Options:
+    --name <n>          a label for status
+    --cpus <n>          cores it needs (default 1)
+    --gpus <n>          GPUs it needs; it sees them as CUDA_VISIBLE_DEVICES
+    --mem <mb>          memory it needs, in MB
+    --est <duration>    how long it should take; the cap defaults to 3x this
+    --cap <duration>    kill it after this long, or `never`
+    --after <ids>       run only once these are done: j1,j2 (repeatable)
+    --cwd <dir>         run here instead
+    --env <key=value>   set in its environment (repeatable)
+    --env-pass <key>    copy this variable's value now (repeatable)
+    --watch <path>      warn if this changed before it runs (repeatable)
+    --watch-fail <path> fail instead of running if it changed (repeatable)
+    --eval <text>       the prompt to judge its output by
+    --retries <n>       re-run it up to n times on failure; implies
+                        --idempotent
+    --idempotent        safe to run again after a lost lease
+    --on-done <command> a shell line to spawn once it settles
+    --exec              no shell: the first word is the program
+
 status shows every job, one line each, or one job in full; --json prints
-one JSON object per job instead.
+one JSON object per job instead. logs prints the latest attempt's stdout,
+or its stderr with --err, or with --path only where it is. cancel stops
+jobs that have not started, and everything that depends on them.
 
 wait exits 0 when every job is done, 1 when any failed or was cancelled,
-and 124 when the timeout came first (like timeout(1)); a timeout takes
+and 124 when the timeout came first (like timeout(1)). A duration is
 seconds, or 90s, 5m, 1.5h. check exits 1 when a job depends on code that
 changed. Exit 2 is pec itself failing: a bad argument, or a store it
 cannot use.
-
-deferred: submit, logs.
 ";
 
 /// Exit code for a wait the timeout ended, as timeout(1) has it.
@@ -103,6 +135,64 @@ fn run() -> Result<ExitCode> {
 
     let command = args.next().unwrap_or_else(|| "help".into());
     match command.as_str() {
+        // Parsed before the store is opened, so a typo creates nothing.
+        "submit" => {
+            let job = parse_submit(args.collect())?;
+            println!("{}", open()?.submit(job)?);
+        }
+        "barrier" => {
+            let job = parse_barrier(args.collect())?;
+            println!("{}", open()?.submit(job)?);
+        }
+        "logs" => {
+            let (mut err, mut path_only, mut id) = (false, false, None);
+            for arg in args {
+                match arg.as_str() {
+                    "--err" => err = true,
+                    "--path" => path_only = true,
+                    raw => id = Some(parse_id(raw)?),
+                }
+            }
+            let Some(id) = id else {
+                return usage("logs needs a job id");
+            };
+            let logs = open()?.logs(id)?;
+            let path = if err { logs.stderr } else { logs.stdout };
+            if path_only {
+                println!("{}", path.display());
+            } else {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let _ = std::io::stdout().write_all(&bytes);
+                    }
+                    Err(_) => {
+                        eprintln!("pec: {id} has no output at {}", path.display());
+                        return Ok(ExitCode::FAILURE);
+                    }
+                }
+            }
+        }
+        "cancel" => {
+            let ids = args.map(|a| parse_id(&a)).collect::<Result<Vec<_>>>()?;
+            if ids.is_empty() {
+                return usage("cancel needs at least one job id");
+            }
+            let q = open()?;
+            let mut code = ExitCode::SUCCESS;
+            for id in ids {
+                q.cancel(id)?;
+                match q.status(id)?.state {
+                    State::Cancelled => println!("{id} cancelled"),
+                    state => {
+                        eprintln!(
+                            "pec: {id} is {state}; only a job that has not started can be cancelled"
+                        );
+                        code = ExitCode::FAILURE;
+                    }
+                }
+            }
+            return Ok(code);
+        }
         "status" => {
             let q = open()?;
             let mut json = false;
@@ -243,10 +333,185 @@ fn run() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `pec submit [<options>] -- <command>...`, as the job it describes.
+fn parse_submit(words: Vec<String>) -> Result<Job> {
+    let Some(split) = words.iter().position(|w| w == "--") else {
+        return usage("submit needs `-- <command>` after its options");
+    };
+    let command = &words[split + 1..];
+    if command.is_empty() {
+        return usage("submit needs a command after --");
+    }
+
+    let mut exec = false;
+    let mut cwd = None;
+    let mut env = Vec::new();
+    let mut name = None;
+    let mut cpus = None;
+    let mut gpus = None;
+    let mut mem_mb = None;
+    let mut est = None;
+    let mut cap = None;
+    let mut after = Vec::new();
+    let mut watched = Vec::new();
+    let mut eval = None;
+    let mut retries = None;
+    let mut idempotent = false;
+    let mut on_done = None;
+
+    let mut flags = words[..split].iter();
+    while let Some(flag) = flags.next() {
+        let mut value = || match flags.next() {
+            Some(v) => Ok(v.as_str()),
+            None => usage(format!("{flag} needs a value")),
+        };
+        match flag.as_str() {
+            "--exec" => exec = true,
+            "--idempotent" => idempotent = true,
+            "--name" => name = Some(value()?.to_string()),
+            "--cpus" => cpus = Some(number(flag, value()?)?),
+            "--gpus" => gpus = Some(number(flag, value()?)?),
+            "--mem" => mem_mb = Some(number(flag, value()?)?),
+            "--est" => est = Some(parse_duration(value()?)?),
+            "--cap" => {
+                cap = Some(match value()? {
+                    "never" => KillAfter::Never,
+                    raw => KillAfter::Fixed(parse_duration(raw)?),
+                })
+            }
+            "--after" => after.extend(parse_ids(value()?)?),
+            "--cwd" => cwd = Some(absolute(value()?)?),
+            "--env" => match value()?.split_once('=') {
+                Some((key, val)) if !key.is_empty() => env.push((key.into(), val.into())),
+                _ => return usage("--env takes key=value"),
+            },
+            // Read now, from the submitting shell: the worker that runs
+            // the job an hour later has an environment of its own.
+            "--env-pass" => {
+                let key = value()?;
+                match std::env::var(key) {
+                    Ok(val) => env.push((key.to_string(), val)),
+                    Err(_) => return usage(format!("--env-pass {key}: not set here")),
+                }
+            }
+            // Absolute, because the path is hashed here and checked again
+            // by a worker that may be standing somewhere else.
+            "--watch" => watched.push((absolute(value()?)?, OnChange::Warn)),
+            "--watch-fail" => watched.push((absolute(value()?)?, OnChange::Fail)),
+            "--eval" => eval = Some(value()?.to_string()),
+            "--retries" => retries = Some(number(flag, value()?)?),
+            "--on-done" => on_done = Some(value()?.to_string()),
+            other => return usage(format!("submit does not take {other}")),
+        }
+    }
+
+    let mut cmd = if exec {
+        Command::exec(&command[0], &command[1..])
+    } else {
+        Command::line(command.join(" "))
+    };
+    // A job submitted from a shell runs where it was submitted, as it
+    // would have had it been typed there.
+    cmd = cmd.cwd(match cwd {
+        Some(dir) => dir,
+        None => absolute(".")?,
+    });
+    for (key, val) in env {
+        cmd = cmd.env(key, val);
+    }
+
+    let mut job = Job::run(cmd).after(after);
+    if let Some(name) = name {
+        job = job.name(name);
+    }
+    if let Some(n) = cpus {
+        job = job.cpus(n);
+    }
+    if let Some(n) = gpus {
+        job = job.gpus(n);
+    }
+    if let Some(mb) = mem_mb {
+        job = job.mem_mb(mb);
+    }
+    if let Some(d) = est {
+        job = job.est(d);
+    }
+    if let Some(cap) = cap {
+        job = job.kill_after(cap);
+    }
+    for (path, on_change) in watched {
+        job = job.watch_as(path, on_change);
+    }
+    if let Some(prompt) = eval {
+        job = job.eval_prompt(prompt);
+    }
+    // Asking for a retry is saying a second run is safe.
+    if let Some(n) = retries {
+        job = job.retries(n).idempotent(true);
+    }
+    if idempotent {
+        job = job.idempotent(true);
+    }
+    if let Some(line) = on_done {
+        job = job.on_done(line);
+    }
+    Ok(job)
+}
+
+/// `pec barrier --after <ids> [...]`, as the barrier it describes.
+fn parse_barrier(words: Vec<String>) -> Result<Job> {
+    let mut job = Job::barrier();
+    let mut after = Vec::new();
+    let mut flags = words.iter();
+    while let Some(flag) = flags.next() {
+        let mut value = || match flags.next() {
+            Some(v) => Ok(v.as_str()),
+            None => usage(format!("{flag} needs a value")),
+        };
+        match flag.as_str() {
+            "--after" => after.extend(parse_ids(value()?)?),
+            "--name" => job = job.name(value()?),
+            "--eval" => job = job.eval_prompt(value()?),
+            "--on-done" => job = job.on_done(value()?),
+            "--fail-at-end" => job = job.policy(FailurePolicy::FailAtEnd),
+            other => return usage(format!("barrier does not take {other}")),
+        }
+    }
+    // A barrier on nothing is done the moment it exists; almost certainly
+    // not what was meant.
+    if after.is_empty() {
+        return usage("barrier needs --after <ids>");
+    }
+    Ok(job.after(after))
+}
+
 fn parse_id(raw: &str) -> Result<JobId> {
     match raw.parse() {
         Ok(id) => Ok(id),
         Err(_) => usage(format!("{raw:?} is not a job id; they look like j42")),
+    }
+}
+
+/// `j1,j2`, as a shell passes a list without quoting.
+fn parse_ids(raw: &str) -> Result<Vec<JobId>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_id)
+        .collect()
+}
+
+fn number<T: std::str::FromStr>(flag: &str, raw: &str) -> Result<T> {
+    match raw.parse() {
+        Ok(n) => Ok(n),
+        Err(_) => usage(format!("{flag} takes a number, not {raw:?}")),
+    }
+}
+
+fn absolute(path: &str) -> Result<PathBuf> {
+    match std::path::absolute(path) {
+        Ok(p) => Ok(p),
+        Err(e) => usage(format!("{path}: {e}")),
     }
 }
 

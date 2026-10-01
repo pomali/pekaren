@@ -6,8 +6,8 @@ use std::path::Path;
 use std::process::Output;
 use std::time::Duration;
 
-use pekaren::Worker;
 use pekaren::prelude::*;
+use pekaren::{Filter, Worker};
 
 fn queue(dir: &Path) -> Queue {
     Queue::options().work_on_submit(false).open(dir).unwrap()
@@ -41,6 +41,183 @@ fn json_lines(out: &Output) -> Vec<serde_json::Value> {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
         .collect()
+}
+
+/// The id `pec submit` or `pec barrier` printed, once it has succeeded.
+fn submitted(out: Output) -> JobId {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout(&out).trim().parse().expect("a job id")
+}
+
+#[test]
+fn submit_records_everything_the_flags_say() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    std::fs::write(dir.path().join("data.txt"), "v1").unwrap();
+
+    let first = submitted(pec(&store, &["submit", "--name", "first", "--", "true"]));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pec"))
+        .arg("--store")
+        .arg(&store)
+        .current_dir(dir.path())
+        .env("PEC_TEST_SECRET", "passed along")
+        .args(["submit", "--name", "train", "--cpus", "2", "--gpus", "1"])
+        .args(["--mem", "512", "--est", "5m", "--cap", "90s"])
+        .args(["--after", &first.to_string(), "--env", "LR=3e-4"])
+        .args(["--env-pass", "PEC_TEST_SECRET", "--watch", "data.txt"])
+        .args(["--eval", "Loss below 0.3", "--"])
+        .args(["echo", "$LR", "$PEC_TEST_SECRET"])
+        .output()
+        .unwrap();
+    let id = submitted(out);
+
+    let q = queue(&store);
+    let s = q.status(id).unwrap();
+    assert_eq!(s.name.as_deref(), Some("train"));
+    assert_eq!(s.deps, [first]);
+    assert_eq!(s.eval_prompt.as_deref(), Some("Loss below 0.3"));
+    assert_eq!(
+        (s.resources.cpus, s.resources.gpus, s.resources.mem_mb),
+        (2, 1, 512)
+    );
+    assert_eq!(s.resources.est, Some(Duration::from_secs(300)));
+
+    // The words after -- are one shell line, run where pec was called.
+    let cmd = q.command(id).unwrap().unwrap();
+    assert!(cmd.shell);
+    assert_eq!(cmd.program, "echo $LR $PEC_TEST_SECRET");
+    assert_eq!(cmd.cwd, Some(std::path::absolute(dir.path()).unwrap()));
+    assert!(cmd.env.contains(&("LR".into(), "3e-4".into())));
+    assert!(
+        cmd.env
+            .contains(&("PEC_TEST_SECRET".into(), "passed along".into()))
+    );
+
+    // The relative watch was made absolute, so a worker standing anywhere
+    // checks the same file.
+    std::fs::write(dir.path().join("data.txt"), "v2").unwrap();
+    worker(&q).run_until_idle().unwrap();
+    assert_eq!(q.status(id).unwrap().state, State::Done);
+    assert!(
+        q.events(id)
+            .unwrap()
+            .iter()
+            .any(|e| e.message.contains("data.txt changed since submit"))
+    );
+
+    let logs = pec(&store, &["logs", &id.to_string()]);
+    assert_eq!(stdout(&logs), "3e-4 passed along\n");
+    let path = stdout(&pec(&store, &["logs", "--err", "--path", &id.to_string()]));
+    assert!(path.trim_end().ends_with("1.err"), "{path}");
+}
+
+#[test]
+fn submit_can_skip_the_shell_refuse_changed_code_and_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let tool = dir.path().join("tool.sh");
+    std::fs::write(&tool, "echo one").unwrap();
+    let tool = tool.to_str().unwrap();
+
+    let exec = submitted(pec(
+        &store,
+        &["submit", "--exec", "--", "printf", "%s|", "a b", "$HOME"],
+    ));
+    let guarded = submitted(pec(
+        &store,
+        &["submit", "--watch-fail", tool, "--", "sh", tool],
+    ));
+    let retried = submitted(pec(&store, &["submit", "--retries", "1", "--", "exit 1"]));
+    std::fs::write(tool, "echo two").unwrap();
+
+    let q = queue(&store);
+    worker(&q).run_until_idle().unwrap();
+
+    // No shell: nothing split, nothing expanded.
+    assert_eq!(
+        stdout(&pec(&store, &["logs", &exec.to_string()])),
+        "a b|$HOME|"
+    );
+
+    let s = q.status(guarded).unwrap();
+    assert_eq!(s.state, State::Failed);
+    assert!(s.failure.unwrap().contains("changed since submit"));
+    assert_eq!(s.exit_code, None, "it must not have run");
+
+    let s = q.status(retried).unwrap();
+    assert_eq!((s.state, s.attempt), (State::Failed, 2));
+}
+
+#[test]
+fn barrier_cancel_and_the_mistakes_pec_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let a = submitted(pec(&store, &["submit", "--", "true"]));
+    let b = submitted(pec(
+        &store,
+        &["submit", "--after", &a.to_string(), "--", "true"],
+    ));
+    let barrier = submitted(pec(
+        &store,
+        &[
+            "barrier",
+            "--after",
+            &format!("{a},{b}"),
+            "--name",
+            "both",
+            "--fail-at-end",
+            "--on-done",
+            "echo woke",
+        ],
+    ));
+
+    let q = queue(&store);
+    let s = q.status(barrier).unwrap();
+    assert!(s.is_barrier);
+    assert_eq!(s.deps, [a, b]);
+    assert_eq!(s.name.as_deref(), Some("both"));
+
+    // Cancelling the first takes everything behind it along.
+    let out = pec(&store, &["cancel", &a.to_string()]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(stdout(&out).trim(), format!("{a} cancelled"));
+    assert_eq!(q.status(b).unwrap().state, State::Cancelled);
+    assert_eq!(q.status(barrier).unwrap().state, State::Failed);
+
+    // A job that already ran cannot be.
+    let ran = submitted(pec(&store, &["submit", "--", "true"]));
+    worker(&q).run_until_idle().unwrap();
+    assert_eq!(
+        pec(&store, &["cancel", &ran.to_string()]).status.code(),
+        Some(1)
+    );
+
+    // Every mistake is exit 2, and none of them leaves a job behind.
+    let before = q.list(Filter::All).unwrap().len();
+    for args in [
+        &["submit", "true"][..],
+        &["submit", "--"],
+        &["submit", "--cpus", "many", "--", "true"],
+        &["submit", "--env", "novalue", "--", "true"],
+        &[
+            "submit",
+            "--env-pass",
+            "PEC_TEST_SURELY_UNSET",
+            "--",
+            "true",
+        ],
+        &["submit", "--after", "j999", "--", "true"],
+        &["submit", "--frobnicate", "--", "true"],
+        &["submit", "--est", "--", "true"],
+        &["barrier", "--name", "lonely"],
+    ] {
+        assert_eq!(pec(&store, args).status.code(), Some(2), "{args:?}");
+    }
+    assert_eq!(q.list(Filter::All).unwrap().len(), before);
 }
 
 #[test]
