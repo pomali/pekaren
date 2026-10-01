@@ -302,6 +302,13 @@ impl<'q> Worker<'q> {
             .stdin(Stdio::null())
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err));
+        // Its own process group, so a kill reaches what a shell line or a
+        // bash script started under it (python, cargo), not just `sh`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            process.process_group(0);
+        }
 
         process
             .spawn()
@@ -338,7 +345,7 @@ impl<'q> Worker<'q> {
             // this catches the frozen box, alive but long since reclaimed.
             if last_renew.elapsed() >= self.lease / 3 {
                 if !self.queue.store().renew(claim, self.lease)? {
-                    let _ = child.kill();
+                    kill_group(child);
                     let _ = child.wait();
                     return Ok((Outcome::Cancelled, None, samples));
                 }
@@ -353,7 +360,7 @@ impl<'q> Worker<'q> {
             }
 
             if claim.kill_after.is_some_and(|cap| started.elapsed() > cap) {
-                let _ = child.kill();
+                kill_group(child);
                 let _ = child.wait();
                 return Ok((Outcome::Killed, None, samples));
             }
@@ -383,6 +390,17 @@ impl<'q> Worker<'q> {
         std::fs::rename(&claim.scratch, &dest).map_err(|e| Error::io(&dest, e))?;
         Ok(())
     }
+}
+
+/// Kill the child and everything in its process group.
+fn kill_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", "--", &format!("-{}", child.id())])
+            .status();
+    }
+    let _ = child.kill();
 }
 
 enum Committed {

@@ -541,9 +541,10 @@ pub fn default_store_path() -> PathBuf {
 
 #[cfg(unix)]
 fn kill(pid: u32) -> bool {
+    // The worker starts each child as its own process group leader, so the
+    // group id is the pid: take the whole tree, not just the shell.
     std::process::Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
+        .args(["-9", "--", &format!("-{pid}")])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
