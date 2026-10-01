@@ -153,6 +153,50 @@ fn submit_can_skip_the_shell_refuse_changed_code_and_retry() {
 }
 
 #[test]
+fn work_forever_idles_until_sigterm_and_finishes_what_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let q = queue(&store);
+
+    let worker = std::process::Command::new(env!("CARGO_BIN_EXE_pec"))
+        .arg("--store")
+        .arg(&store)
+        .args(["work", "--forever", "--idle", "0.1", "--cpus", "2"])
+        .args(["--gpus", "none"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Submitted after the worker went idle: it has to be looking.
+    std::thread::sleep(Duration::from_millis(300));
+    let slow = q.submit(Job::cmd("sleep 0.6")).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while q.status(slow).unwrap().state != State::Running {
+        assert!(std::time::Instant::now() < deadline, "never claimed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Asked to stop mid-job, it commits the job before it goes.
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &worker.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let queued = q.submit(Job::cmd("true")).unwrap();
+    let out = worker.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(q.status(slow).unwrap().state, State::Done);
+    assert_eq!(stdout(&out).trim(), format!("{slow} done"));
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(log.contains("2 cpus, gpus []"), "{log}");
+
+    // And it claimed nothing after the signal.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(q.status(queued).unwrap().state, State::Ready);
+}
+
+#[test]
 fn a_wake_from_the_shell_runs_where_it_was_submitted() {
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("store");

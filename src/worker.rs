@@ -1,7 +1,6 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -67,6 +66,7 @@ pub struct Worker<'q> {
     capacity: Capacity,
     lease: Duration,
     poll: Duration,
+    idle: Option<Duration>,
     host: String,
 }
 
@@ -81,6 +81,7 @@ impl<'q> Worker<'q> {
             }),
             lease: Duration::from_secs(90),
             poll: Duration::from_millis(200),
+            idle: None,
             host: hostname(),
         }
     }
@@ -105,6 +106,15 @@ impl<'q> Worker<'q> {
         self
     }
 
+    /// How often to look at the store when nothing is claimable, if not
+    /// as often as at the child. A worker that stays up for days has no
+    /// reason to take the store's write lock five times a second; stopping
+    /// is still noticed within one poll interval.
+    pub fn idle_interval(mut self, d: Duration) -> Self {
+        self.idle = Some(d);
+        self
+    }
+
     /// Claim and run one job if anything is claimable right now. Returns
     /// `None` when nothing is.
     pub fn run_one(&mut self) -> Result<Option<JobId>> {
@@ -124,27 +134,31 @@ impl<'q> Worker<'q> {
 
     /// Run until the store holds nothing this worker can claim.
     pub fn run_until_idle(&mut self) -> Result<WorkerReport> {
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = AtomicBool::new(false);
         self.run_inner(&stop, None, true)
     }
 
     /// Run for at most `d`, then return. Claims nothing new past the
     /// deadline, and never abandons a child it started.
     pub fn run_for(&mut self, d: Duration) -> Result<WorkerReport> {
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = AtomicBool::new(false);
         self.run_inner(&stop, Some(Instant::now() + d), false)
     }
 
     /// Run until someone sets `stop`. This is what a background worker
-    /// thread does: idle politely rather than exiting when the queue
-    /// empties.
-    pub fn run_while(&mut self, stop: &Arc<AtomicBool>) -> Result<WorkerReport> {
+    /// thread does, and `pec work --forever`: idle politely rather than
+    /// exiting when the queue empties.
+    ///
+    /// `stop` is read between jobs, so a job already running is finished
+    /// and committed first. It is a plain `AtomicBool` so it can be a
+    /// `static` a signal handler sets; an `Arc` coerces to it.
+    pub fn run_while(&mut self, stop: &AtomicBool) -> Result<WorkerReport> {
         self.run_inner(stop, None, false)
     }
 
     fn run_inner(
         &mut self,
-        stop: &Arc<AtomicBool>,
+        stop: &AtomicBool,
         deadline: Option<Instant>,
         stop_when_idle: bool,
     ) -> Result<WorkerReport> {
@@ -174,7 +188,18 @@ impl<'q> Worker<'q> {
                     self.settle()?;
                 }
                 None if stop_when_idle => break,
-                None => std::thread::sleep(self.poll),
+                None => {
+                    // In poll-sized steps, so a stop is not kept waiting
+                    // for a long idle interval.
+                    let until = Instant::now() + self.idle.unwrap_or(self.poll);
+                    while !stop.load(Ordering::Relaxed) {
+                        let left = until.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        std::thread::sleep(left.min(self.poll));
+                    }
+                }
             }
         }
         Ok(report)

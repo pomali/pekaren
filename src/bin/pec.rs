@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pekaren::{
@@ -26,7 +27,8 @@ usage:
     pec [--store <dir>] submit [<options>] -- <command>...
     pec [--store <dir>] barrier --after <ids> [--name <n>] [--eval <text>]
                                 [--on-done <command>] [--fail-at-end]
-    pec [--store <dir>] work [--once]
+    pec [--store <dir>] work [--once | --forever [--idle <duration>]]
+                             [--cpus <n>] [--gpus <0,1|none>]
     pec [--store <dir>] status [--json] [<job-id>...]
     pec [--store <dir>] wait [--timeout <secs>] [--json] <job-id>...
     pec [--store <dir>] logs [--err] [--path] <job-id>
@@ -64,6 +66,14 @@ an --on-done line (on a job or a barrier) is spawned once, by whichever
 worker sees the node settle, in the directory pec was called from, with
 PEKAREN_JOB, PEKAREN_STATE and PEKAREN_EVAL_PROMPT set; its output goes to
 logs/<n>/wake.out and wake.err in the store.
+
+work runs jobs one at a time until nothing is claimable, or with --once
+just one. With --forever it stays up, looking at the store every --idle
+(default 1s) when there is nothing to do, until SIGTERM or SIGINT: then it
+finishes the job it is running and exits; a second signal stops it at
+once. Run several for concurrency: they share the host's CPUs and GPUs
+through the store. --cpus and --gpus override what the host appears to
+have (GPUs default to $PEKAREN_GPUS, else $CUDA_VISIBLE_DEVICES).
 
 status shows every job, one line each, or one job in full; --json prints
 one JSON object per job instead. logs prints the latest attempt's stdout,
@@ -252,12 +262,44 @@ fn run() -> Result<ExitCode> {
         // With no daemon, this is how work gets done when the script
         // that submitted it has gone: a worker anyone can start.
         "work" => {
+            let (mut once, mut forever) = (false, false);
+            let mut idle = Duration::from_secs(1);
+            let mut capacity = pekaren::Capacity::detect()?;
+            while let Some(flag) = args.next() {
+                let mut value = || match args.next() {
+                    Some(v) => Ok(v),
+                    None => usage(format!("{flag} needs a value")),
+                };
+                match flag.as_str() {
+                    "--once" => once = true,
+                    "--forever" => forever = true,
+                    "--idle" => idle = parse_duration(&value()?)?,
+                    "--cpus" => capacity.cpus = number(&flag, &value()?)?,
+                    "--gpus" => capacity.gpus = parse_devices(&value()?)?,
+                    other => return usage(format!("work does not take {other}")),
+                }
+            }
             let q = open()?;
-            let once = args.next().as_deref() == Some("--once");
-            let mut worker = pekaren::Worker::new(&q);
+            let mut worker = pekaren::Worker::new(&q).capacity(capacity.clone());
             let report = if once {
                 worker.run_one()?;
                 Default::default()
+            } else if forever {
+                stop_on_signals();
+                eprintln!(
+                    "pec work: pid {}, {} cpus, gpus {:?}, store {}; stop with kill {0}",
+                    std::process::id(),
+                    capacity.cpus,
+                    capacity.gpus,
+                    q.path().display(),
+                );
+                let report = worker.idle_interval(idle).run_while(&STOP)?;
+                eprintln!(
+                    "pec work: stopped; {} done, {} failed",
+                    report.committed.len(),
+                    report.failed.len()
+                );
+                report
             } else {
                 worker.run_until_idle()?
             };
@@ -501,6 +543,56 @@ fn parse_id(raw: &str) -> Result<JobId> {
         Ok(id) => Ok(id),
         Err(_) => usage(format!("{raw:?} is not a job id; they look like j42")),
     }
+}
+
+/// Set by SIGTERM or SIGINT. `pec work --forever` reads it between jobs:
+/// it claims nothing new, finishes and commits what it is running, then
+/// exits.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Route SIGTERM and SIGINT to [`STOP`]. A second one takes the default
+/// action and ends the worker at once; its running child, in a process
+/// group of its own, is then left to the next worker, which reclaims the
+/// lease once it rots and kills the child.
+///
+/// std has no signal API, and one flag is not worth a dependency: the
+/// handler only stores to an atomic and resets its own disposition, both
+/// async-signal-safe.
+#[cfg(unix)]
+fn stop_on_signals() {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    const SIG_DFL: usize = 0;
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    extern "C" fn on_signal(signum: i32) {
+        STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: signal(2) is async-signal-safe, and SIG_DFL is valid
+        // for any signal.
+        unsafe {
+            signal(signum, SIG_DFL);
+        }
+    }
+    let handler = on_signal as extern "C" fn(i32) as usize;
+    // SAFETY: the handler has the signature signal(2) expects, lives for
+    // the whole program, and does nothing that is not async-signal-safe.
+    unsafe {
+        signal(SIGINT, handler);
+        signal(SIGTERM, handler);
+    }
+}
+
+#[cfg(not(unix))]
+fn stop_on_signals() {}
+
+/// GPU device indices: `0,1`, or `none` (or nothing) for a worker that
+/// should take no GPU job.
+fn parse_devices(raw: &str) -> Result<Vec<u32>> {
+    if raw.is_empty() || raw == "none" {
+        return Ok(Vec::new());
+    }
+    raw.split(',').map(|d| number("--gpus", d.trim())).collect()
 }
 
 /// `j1,j2`, as a shell passes a list without quoting.
