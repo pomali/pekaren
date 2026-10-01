@@ -45,6 +45,11 @@ pec reap          # reclaim rotted leases, kill orphans
 pec status        # one line per job; `pec status j3` for one in full
 ```
 
+`pec wait` answers in its exit code: 0 when every job is done, 1 when any
+failed or was cancelled, 124 when `--timeout` came first. Exit 2 is `pec`
+itself failing — a bad argument, a store it cannot open — so a script can
+tell "the job failed" from "the question was wrong".
+
 `pec status --json` prints one JSON object per job instead — state, exit
 code, failure, dependencies, declared resources, timing, the command, log
 paths, the evaluation prompt, the profile and the events — for a script or

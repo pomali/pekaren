@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use pekaren::{Filter, JobId, JobStatus, Queue, QueueOptions, Result, State, default_store_path};
+use pekaren::{Filter, JobId, JobStatus, Queue, QueueOptions, State, default_store_path};
 
 const USAGE: &str = "\
 pec — pekáreň's oven
@@ -22,7 +22,7 @@ usage:
     pec [--store <dir>] status [--json] [<job-id>...]
     pec [--store <dir>] runnable
     pec [--store <dir>] check [<job-id>]
-    pec [--store <dir>] wait <job-id>...
+    pec [--store <dir>] wait [--timeout <secs>] [--json] <job-id>...
     pec [--store <dir>] reap
     pec [--store <dir>] where
 
@@ -31,20 +31,58 @@ the store defaults to $PEKAREN_STORE, else ~/.pekaren.
 status shows every job, one line each, or one job in full; --json prints
 one JSON object per job instead.
 
+wait exits 0 when every job is done, 1 when any failed or was cancelled,
+and 124 when the timeout came first (like timeout(1)); a timeout takes
+seconds, or 90s, 5m, 1.5h. check exits 1 when a job depends on code that
+changed. Exit 2 is pec itself failing: a bad argument, or a store it
+cannot use.
+
 deferred: submit, logs.
 ";
 
+/// Exit code for a wait the timeout ended, as timeout(1) has it.
+const TIMED_OUT: u8 = 124;
+
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("pec: {e}");
-            ExitCode::FAILURE
+            ExitCode::from(2)
         }
     }
 }
 
-fn run() -> Result<()> {
+/// What stops pec before it can answer. Both kinds exit 2, so that 1 can
+/// always mean "a job did not succeed".
+#[derive(Debug)]
+enum CliError {
+    Store(pekaren::Error),
+    Usage(String),
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliError::Store(e) => e.fmt(f),
+            CliError::Usage(what) => write!(f, "{what} (pec help for usage)"),
+        }
+    }
+}
+
+impl From<pekaren::Error> for CliError {
+    fn from(e: pekaren::Error) -> Self {
+        CliError::Store(e)
+    }
+}
+
+type Result<T> = std::result::Result<T, CliError>;
+
+fn usage<T>(what: impl Into<String>) -> Result<T> {
+    Err(CliError::Usage(what.into()))
+}
+
+fn run() -> Result<ExitCode> {
     let mut args = std::env::args().skip(1).peekable();
     let mut store: Option<String> = None;
 
@@ -57,10 +95,10 @@ fn run() -> Result<()> {
     // library's default is for a submitting script.
     let open = || -> Result<Queue> {
         let opts = QueueOptions::default().work_on_submit(false);
-        match &store {
-            Some(dir) => opts.open(dir),
-            None => opts.open_default(),
-        }
+        Ok(match &store {
+            Some(dir) => opts.open(dir)?,
+            None => opts.open_default()?,
+        })
     };
 
     let command = args.next().unwrap_or_else(|| "help".into());
@@ -112,9 +150,8 @@ fn run() -> Result<()> {
                 }
             }
             if fatal > 0 {
-                return Err(pekaren::Error::NotImplemented(
-                    "jobs above depend on code that changed; they fail when claimed",
-                ));
+                eprintln!("pec: jobs above depend on code that changed; they fail when claimed");
+                return Ok(ExitCode::FAILURE);
             }
         }
         // With no daemon, this is how work gets done when the script
@@ -136,12 +173,45 @@ fn run() -> Result<()> {
                 println!("{id} failed");
             }
         }
+        // The exit code is the answer, so a shell or an agent can branch
+        // on it without reading anything; the lines are for the reader.
         "wait" => {
-            let q = open()?;
-            let ids = args.map(|a| parse_id(&a)).collect::<Result<Vec<_>>>()?;
-            for s in q.wait(&ids, None)? {
-                println!("{}", status_line(&q, &s)?);
+            let mut json = false;
+            let mut timeout = None;
+            let mut ids = Vec::new();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    "--timeout" => match args.next() {
+                        Some(t) => timeout = Some(parse_duration(&t)?),
+                        None => return usage("--timeout needs a value"),
+                    },
+                    id => ids.push(parse_id(id)?),
+                }
             }
+            if ids.is_empty() {
+                return usage("wait needs at least one job id");
+            }
+            let q = open()?;
+            let statuses = match q.wait(&ids, timeout) {
+                Ok(statuses) => statuses,
+                Err(pekaren::Error::WaitTimeout(_)) => q.statuses(&ids)?,
+                Err(e) => return Err(e.into()),
+            };
+            for s in &statuses {
+                if json {
+                    println!("{}", status_json(&q, s)?);
+                } else {
+                    println!("{}", status_line(&q, s)?);
+                }
+            }
+            return Ok(if !statuses.iter().all(|s| s.state.is_settled()) {
+                ExitCode::from(TIMED_OUT)
+            } else if statuses.iter().all(|s| s.state == State::Done) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            });
         }
         "reap" => {
             let q = open()?;
@@ -164,14 +234,36 @@ fn run() -> Result<()> {
             Some(dir) => println!("{dir}"),
             None => println!("{}", default_store_path().display()),
         },
-        _ => print!("{USAGE}"),
+        "help" | "--help" | "-h" => print!("{USAGE}"),
+        other => {
+            eprint!("pec: no command {other:?}\n\n{USAGE}");
+            return Ok(ExitCode::from(2));
+        }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn parse_id(raw: &str) -> Result<JobId> {
-    raw.parse()
-        .map_err(|_| pekaren::Error::NotImplemented("job id must look like j42"))
+    match raw.parse() {
+        Ok(id) => Ok(id),
+        Err(_) => usage(format!("{raw:?} is not a job id; they look like j42")),
+    }
+}
+
+/// Seconds, or a number with a unit: `90`, `90s`, `5m`, `1.5h`.
+fn parse_duration(raw: &str) -> Result<Duration> {
+    let (number, scale) = match raw.char_indices().last() {
+        Some((i, 's')) => (&raw[..i], 1.0),
+        Some((i, 'm')) => (&raw[..i], 60.0),
+        Some((i, 'h')) => (&raw[..i], 3600.0),
+        _ => (raw, 1.0),
+    };
+    match number.parse::<f64>() {
+        Ok(n) if n >= 0.0 && n.is_finite() => Ok(Duration::from_secs_f64(n * scale)),
+        _ => usage(format!(
+            "{raw:?} is not a duration; try 90, 90s, 5m or 1.5h"
+        )),
+    }
 }
 
 fn kind(s: &JobStatus) -> &'static str {

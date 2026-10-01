@@ -133,3 +133,46 @@ fn status_is_a_table_and_one_job_in_full() {
     assert!(full.contains("eval      Should not fail"), "{full}");
     assert!(full.contains("1.err"), "{full}");
 }
+
+#[test]
+fn wait_says_how_it_went_in_its_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = queue(dir.path());
+    let ok = q.submit(Job::cmd("true")).unwrap();
+    let bad = q.submit(Job::cmd("exit 3")).unwrap();
+    let stranded = q.submit(Job::cmd("true").after([bad])).unwrap();
+    worker(&q).run_until_idle().unwrap();
+    // Submitted after the worker left, so nothing will run it.
+    let queued = q.submit(Job::cmd("true")).unwrap();
+
+    let code = |args: &[&str]| pec(dir.path(), args).status.code();
+    let (ok, bad, stranded, queued) = (
+        ok.to_string(),
+        bad.to_string(),
+        stranded.to_string(),
+        queued.to_string(),
+    );
+
+    assert_eq!(code(&["wait", &ok]), Some(0));
+    assert_eq!(code(&["wait", &ok, &bad]), Some(1));
+    // A job a failed dependency stranded settles too, as cancelled.
+    assert_eq!(code(&["wait", &stranded]), Some(1));
+    assert_eq!(code(&["wait", "--timeout", "0.2", &queued]), Some(124));
+
+    // Whatever the outcome, every job gets its line, JSON if asked.
+    let out = pec(
+        dir.path(),
+        &["wait", "--timeout", "0", "--json", &ok, &queued],
+    );
+    assert_eq!(out.status.code(), Some(124));
+    let states: Vec<String> = stdout(&out)
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["state"].to_string())
+        .collect();
+    assert_eq!(states, ["\"done\"", "\"ready\""]);
+
+    // pec failing is not a job failing.
+    assert_eq!(code(&["wait", "j9999"]), Some(2));
+    assert_eq!(code(&["wait"]), Some(2));
+    assert_eq!(code(&["wait", "--timeout", "soon", &ok]), Some(2));
+}
