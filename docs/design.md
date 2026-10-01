@@ -57,6 +57,15 @@ fails the job if it changed, and inputs declared with `watch`, which warn.
 A rebuilt binary judged against an hour-old evaluation prompt is not the
 job that was submitted.
 
+**Pinned to a commit.** A job can instead be pinned to the commit its
+repository is at when it is submitted (`Job::pin`, `pec submit --pin`).
+The commit is recorded, and a worker runs the job in a checkout of it — a
+*lane* under the store, one per repository, reused so builds stay
+incremental — rather than in a working tree that has moved on. A lane is a
+named resource like a GPU: held by the running job pinned to that
+repository, derived from live jobs, never stored. Kept to one module
+(`src/pin.rs`), since it is the only place the queue knows about git.
+
 **Grace window.** After submitting, the script stays attached for a short
 window (5–10 s). A job that dies in that window almost always failed on
 something trivial, such as a bad path or missing binary, and that failure

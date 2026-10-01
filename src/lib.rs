@@ -42,6 +42,7 @@ mod error;
 mod hash;
 mod id;
 mod job;
+mod pin;
 mod profile;
 mod queue;
 mod store;
@@ -54,6 +55,7 @@ pub use job::{
     Command, FailurePolicy, InputKind, Job, JobKind, KillAfter, OnChange, Resources, RustScript,
     RustSource, Wake, WatchedPath,
 };
+pub use pin::{GIT_ENV, Pin, Pinned};
 pub use profile::{Profile, Sample};
 pub use queue::{
     Drift, DriftKind, Event, Filter, JobStatus, Level, Logs, Queue, QueueOptions, ReapReport,
@@ -67,11 +69,11 @@ pub use worker::{Capacity, Worker, WorkerReport};
 pub mod prelude {
     pub use crate::FailurePolicy::*;
     pub use crate::{
-        Command, Drift, FailurePolicy, Job, JobCtx, JobId, JobStatus, OnChange, Queue, Resources,
-        Result, State, Task, TaskResult, Tasks, Wake, default_store_path,
+        Command, Drift, FailurePolicy, Job, JobCtx, JobId, JobStatus, OnChange, Pin, Queue,
+        Resources, Result, State, Task, TaskResult, Tasks, Wake, default_store_path,
     };
 }
 
 /// Schema version this build speaks. A store written by a newer build is
 /// refused rather than migrated backwards.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;

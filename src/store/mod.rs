@@ -14,6 +14,7 @@ use crate::id::JobId;
 use crate::job::{
     Command, InputKind, Job, JobKind, OnChange, Resources, RustSource, Wake, WatchedPath,
 };
+use crate::pin::Pinned;
 use crate::profile::Profile;
 use crate::queue::{Filter, JobStatus, State};
 
@@ -52,6 +53,10 @@ const MIGRATIONS: &[&str] = &[
        message TEXT NOT NULL
      );
      CREATE INDEX job_events_by_job ON job_events (job_id, at);",
+    // v3 -> v4: jobs pinned to a commit.
+    "ALTER TABLE jobs ADD COLUMN pin_repo TEXT;
+     ALTER TABLE jobs ADD COLUMN pin_commit TEXT;
+     ALTER TABLE jobs ADD COLUMN pin_dir TEXT;",
 ];
 
 /// Unix millis, the store's one time unit.
@@ -150,6 +155,11 @@ impl Store {
         self.root.join("logs").join(id.get().to_string())
     }
 
+    /// The checkout that jobs pinned to `repo` run in.
+    pub(crate) fn lane_dir(&self, repo: &Path) -> PathBuf {
+        self.root.join("lanes").join(crate::pin::lane_name(repo))
+    }
+
     /// Write inline Rust source into the store and hand back its path.
     ///
     /// Content-addressed, so the same source submitted twice is one file and
@@ -179,6 +189,24 @@ impl Store {
     /// it has no unmet dependencies and `pending` otherwise; nothing else
     /// decides the runnable set.
     pub(crate) fn insert_job(&self, job: &Job) -> Result<JobId> {
+        // Asking git takes a moment and needs no lock, so it happens before
+        // the transaction does. The tree is where the command will run.
+        let pinned = match (&job.pin, &job.kind) {
+            (Some(pin), kind) if !matches!(kind, JobKind::Barrier) => {
+                let tree = match kind {
+                    JobKind::Command(c) => c.cwd.clone(),
+                    _ => None,
+                };
+                let tree = match tree {
+                    Some(dir) => dir,
+                    None => std::env::current_dir()
+                        .map_err(|e| Error::io(Path::new("<current dir>"), e))?,
+                };
+                Some(crate::pin::resolve(pin, &tree)?)
+            }
+            _ => None,
+        };
+
         let tx = self.write_tx()?;
 
         for dep in &job.deps {
@@ -249,9 +277,9 @@ impl Store {
                  name, kind, shell, program, cwd, script_path, task_name,
                  cpus, gpus, mem_mb, est_secs, kill_after_secs,
                  eval_prompt, retries, idempotent, failure_policy,
-                 state, submitted_at
+                 state, submitted_at, pin_repo, pin_commit, pin_dir
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                       ?17, ?18)",
+                       ?17, ?18, ?19, ?20, ?21)",
             params![
                 job.name,
                 kind,
@@ -275,6 +303,13 @@ impl Store {
                 policy_str(job.policy),
                 state.as_str(),
                 now_ms(),
+                pinned
+                    .as_ref()
+                    .map(|p| p.repo.to_string_lossy().into_owned()),
+                pinned.as_ref().map(|p| p.commit.as_str()),
+                pinned
+                    .as_ref()
+                    .map(|p| p.dir.to_string_lossy().into_owned()),
             ],
         )?;
         let id = JobId::new(tx.last_insert_rowid());
@@ -414,6 +449,7 @@ impl Store {
             finished_at: row.get::<_, Option<i64>>("finished_at")?.map(from_ms),
             deps: self.deps_of(id)?,
             profile: self.profile_of(id)?,
+            pin: read_pin(row)?,
         })
     }
 
@@ -557,6 +593,9 @@ pub(crate) struct Claim {
     pub gpus: Vec<u32>,
     pub kill_after: Option<Duration>,
     pub task: Option<String>,
+    /// The commit to check out and run in, instead of the command's own
+    /// directory.
+    pub pin: Option<Pinned>,
 }
 
 impl Claim {
@@ -621,6 +660,7 @@ impl Store {
             kill_after_secs: Option<i64>,
             task: Option<String>,
             fits: bool,
+            pin: Option<Pinned>,
         }
 
         // Which jobs are this worker's to consider: those that fit what is
@@ -636,21 +676,32 @@ impl Store {
         } else {
             (free_cpus, free_mem, free_gpus.len() as i64)
         };
+        // A pinned job also needs its repository's lane, which any running
+        // job pinned to the same repository holds. Like the free pool, this
+        // is read off live jobs, never stored.
+        let lane_free = "(pin_repo IS NULL OR NOT EXISTS (
+                SELECT 1 FROM jobs held
+                WHERE held.state = 'running' AND held.pin_repo = runnable.pin_repo))";
         let candidate: Option<Candidate> = tx
             .query_row(
-                "SELECT id, gpus, kill_after_secs, task_name,
-                        cpus <= ?4 AND mem_mb <= ?5 AND gpus <= ?6
-                 FROM runnable
-                 WHERE kind = 'command'
-                   AND cpus <= ?1 AND mem_mb <= ?2 AND gpus <= ?3
-                 ORDER BY id LIMIT 1",
+                &format!(
+                    "SELECT id, gpus, kill_after_secs, task_name,
+                            cpus <= ?4 AND mem_mb <= ?5 AND gpus <= ?6 AND {lane_free},
+                            pin_repo, pin_commit, pin_dir
+                     FROM runnable
+                     WHERE kind = 'command'
+                       AND cpus <= ?1 AND mem_mb <= ?2 AND gpus <= ?3
+                       AND (?7 OR {lane_free})
+                     ORDER BY id LIMIT 1"
+                ),
                 params![
                     limits.0,
                     limits.1,
                     limits.2,
                     free_cpus,
                     free_mem,
-                    free_gpus.len() as i64
+                    free_gpus.len() as i64,
+                    strict_fifo,
                 ],
                 |r| {
                     Ok(Candidate {
@@ -659,6 +710,7 @@ impl Store {
                         kill_after_secs: r.get(2)?,
                         task: r.get(3)?,
                         fits: r.get(4)?,
+                        pin: read_pin(r)?,
                     })
                 },
             )
@@ -733,6 +785,7 @@ impl Store {
                 .kill_after_secs
                 .map(|s| Duration::from_secs(s as u64)),
             task: candidate.task,
+            pin: candidate.pin,
         }))
     }
 
@@ -1279,13 +1332,27 @@ fn policy_str(p: crate::job::FailurePolicy) -> &'static str {
 
 const SELECT_ALL: &str = "SELECT id, name, kind, state, stalled, attempt, exit_code, failure,
      eval_prompt, script_path, task_name, cpus, gpus, mem_mb, est_secs,
-     submitted_at, started_at, finished_at
+     submitted_at, started_at, finished_at, pin_repo, pin_commit, pin_dir
      FROM jobs";
 
 const SELECT_JOB: &str = "SELECT id, name, kind, state, stalled, attempt, exit_code, failure,
      eval_prompt, script_path, task_name, cpus, gpus, mem_mb, est_secs,
-     submitted_at, started_at, finished_at
+     submitted_at, started_at, finished_at, pin_repo, pin_commit, pin_dir
      FROM jobs WHERE id = ?1";
+
+/// The commit a job is pinned to, off a row that selected the pin columns.
+fn read_pin(row: &Row<'_>) -> rusqlite::Result<Option<Pinned>> {
+    let repo: Option<String> = row.get("pin_repo")?;
+    let commit: Option<String> = row.get("pin_commit")?;
+    Ok(match (repo, commit) {
+        (Some(repo), Some(commit)) => Some(Pinned {
+            repo: PathBuf::from(repo),
+            commit,
+            dir: PathBuf::from(row.get::<_, Option<String>>("pin_dir")?.unwrap_or_default()),
+        }),
+        _ => None,
+    })
+}
 
 /// One row of `job_inputs`, as the store holds it.
 pub(crate) struct RecordedInput {

@@ -1,4 +1,4 @@
--- pekaren store, schema v3.
+-- pekaren store, schema v4.
 --
 -- Every process that opens this file is a client and potentially a worker;
 -- there is no daemon and no single writer. Three rules follow from that and
@@ -33,6 +33,14 @@ CREATE TABLE jobs (
   -- The registered function a task job runs, inside the binary named by
   -- `program`. NULL for everything else.
   task_name      TEXT,
+  -- Pinned to a commit: the object store to fetch from, the full commit
+  -- id, and the directory within the checkout to run in. The checkout
+  -- (a lane under <store>/lanes, one per repository) is derived, and is
+  -- held by whichever pinned job of that repository is running. NULL
+  -- when the job runs in its working tree.
+  pin_repo       TEXT,
+  pin_commit     TEXT,
+  pin_dir        TEXT,
 
   -- Declaration: admission control, and the baseline for the actual run.
   cpus           INTEGER NOT NULL DEFAULT 1,

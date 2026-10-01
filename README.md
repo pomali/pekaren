@@ -171,6 +171,31 @@ by the shape of the tree — each entry's relative path, length and mtime — so
 a dataset is not read end to end. Findings land in the job's events and
 travel with the result; `pec check` runs the same check by hand.
 
+### Pinned to a commit
+
+Failing on changed code is the safe default; for a job that runs source
+from a repository — a build, a script in a tree someone keeps editing —
+the better answer is to run the commit it was submitted at:
+
+```rust
+q.submit(Job::run(Command::line("cargo build --release").cwd(repo)).pin(Pin::head()))?;
+```
+
+```
+pec submit --pin -- cargo build --release     # HEAD of the repository here
+pec submit --pin v1.2 -- make test            # or a named revision
+```
+
+The commit is resolved at submit, and `Pin::head()` refuses a tree whose
+tracked files have uncommitted changes, which the job would not see
+(`.allow_dirty()` / `--allow-dirty` to pin anyway). A worker runs the job
+in a checkout of that commit under `<store>/lanes` — one lane per
+repository, reused, so builds in it stay incremental — in the same
+directory within the tree, with `PEKAREN_PIN_COMMIT` and `PEKAREN_PIN_REPO`
+set. Two jobs pinned to one repository take turns with its lane.
+`PEKAREN_GIT` names the git that reads the repository at submit time:
+under WSL, `git.exe` for a worktree on the Windows side.
+
 ## Build
 
 ```
@@ -188,6 +213,7 @@ beyond a C compiler.
 | `src/job.rs` | `Job` builder, `Command`, `Resources`, `Wake`, policies |
 | `src/task.rs` | tasks: jobs that are functions in the submitting binary |
 | `src/hash.rs` | change detection for the paths a job depends on |
+| `src/pin.rs` | commit pinning: the one place pekaren talks to git |
 | `src/queue.rs` | `Queue`, `JobStatus`, `State`, submit and read paths |
 | `src/store/` | SQLite: schema, migrations, conditional writes |
 | `src/worker.rs` | claim / supervise / commit loop |

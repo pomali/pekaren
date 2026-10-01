@@ -197,6 +197,82 @@ fn work_forever_idles_until_sigterm_and_finishes_what_it_runs() {
 }
 
 #[test]
+fn submit_pin_records_the_commit_and_asks_the_git_it_is_told_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=test", "-c", "user.email=test@localhost"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    std::fs::write(repo.join("tool.sh"), "echo one\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "one"]);
+    let one = git(&["rev-parse", "HEAD"]);
+
+    // A git that notes it was asked, standing in for git.exe.
+    let asked = dir.path().join("asked");
+    let wrapper = dir.path().join("git-wrapper");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {}\nexec git \"$@\"\n",
+            asked.display()
+        ),
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .args(["+x"])
+        .arg(&wrapper)
+        .status()
+        .unwrap();
+
+    let submit = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_pec"))
+            .arg("--store")
+            .arg(&store)
+            .current_dir(&repo)
+            .env("PEKAREN_GIT", &wrapper)
+            .arg("submit")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let head = submitted(submit(&["--pin", "--", "sh", "tool.sh"]));
+    assert!(
+        std::fs::read_to_string(&asked)
+            .unwrap()
+            .contains("rev-parse")
+    );
+
+    std::fs::write(repo.join("tool.sh"), "echo two\n").unwrap();
+    let refused = submit(&["--pin", "--", "sh", "tool.sh"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("uncommitted"));
+    let dirty = submitted(submit(&["--pin", "--allow-dirty", "--", "sh", "tool.sh"]));
+    git(&["commit", "-qam", "two"]);
+    let named = submitted(submit(&["--pin", &one, "--", "sh", "tool.sh"]));
+
+    let q = queue(&store);
+    worker(&q).run_until_idle().unwrap();
+    for id in [head, dirty, named] {
+        assert_eq!(q.status(id).unwrap().pin.unwrap().commit, one);
+        assert_eq!(stdout(&pec(&store, &["logs", &id.to_string()])), "one\n");
+    }
+    let json = json_lines(&pec(&store, &["status", "--json", &head.to_string()]));
+    assert_eq!(json[0]["pin"]["commit"], one);
+}
+
+#[test]
 fn a_wake_from_the_shell_runs_where_it_was_submitted() {
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("store");

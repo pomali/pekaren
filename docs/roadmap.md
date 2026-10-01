@@ -61,7 +61,11 @@ that has not started), and reclaiming a lease left by another host.
 - Freezing the binary: hard-link or copy a task's executable into the store
   at submit time, so a queued job can run the code it was submitted with
   instead of failing when the binary is rebuilt. Opt-in, once failing
-  proves too strict.
+  proves too strict. For source in a repository, pinning to a commit
+  (`Job::pin`) does this already: the job runs a checkout of the commit
+  it was submitted at.
+- More than one lane per repository, so pinned jobs of one repository can
+  run side by side.
 
 - Starvation: a waiting job reserves capacity past some threshold. Needs the
   threshold. Strict FIFO claiming, opt-in per worker, covers the simple

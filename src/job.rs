@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::id::JobId;
+use crate::pin::Pin;
 use crate::task::Task;
 
 /// A command to run. The library stores it and executes it; it never parses
@@ -333,6 +334,7 @@ pub struct Job {
     pub(crate) task_args: Vec<String>,
     pub(crate) watched: Vec<WatchedPath>,
     pub(crate) on_code_change: OnChange,
+    pub(crate) pin: Option<Pin>,
 }
 
 impl Job {
@@ -467,6 +469,29 @@ impl Job {
         self
     }
 
+    /// Run in a checkout of a commit instead of in the working tree.
+    ///
+    /// Resolved at submit time against the directory the command runs in
+    /// (or the submitter's, if it names none): the commit is recorded, and
+    /// a worker runs the job in a checkout of it under the store — the same
+    /// directory within the tree — however the tree has moved on since.
+    /// Submitting fails with [`Error::Pin`](crate::Error::Pin) when there
+    /// is no commit to pin, or, for [`Pin::head`], when tracked files have
+    /// uncommitted changes the job would not see. Ignored on a barrier.
+    ///
+    /// ```no_run
+    /// # use pekaren::prelude::*;
+    /// # fn main() -> Result<()> {
+    /// # let q = Queue::open_default()?;
+    /// q.submit(Job::cmd("cargo build --release").pin(Pin::head()))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn pin(mut self, pin: Pin) -> Self {
+        self.pin = Some(pin);
+        self
+    }
+
     /// A barrier: no command, fires when its dependencies settle.
     pub fn barrier() -> Self {
         Job::new(JobKind::Barrier)
@@ -487,6 +512,7 @@ impl Job {
             task_args: Vec::new(),
             watched: Vec::new(),
             on_code_change: OnChange::Fail,
+            pin: None,
         }
     }
 

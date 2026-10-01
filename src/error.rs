@@ -71,6 +71,12 @@ pub enum Error {
     #[error("job {id} depends on {path}, which changed since it was submitted")]
     InputChanged { id: JobId, path: std::path::PathBuf },
 
+    /// A job asked to be pinned to a commit and the tree it named could not
+    /// give one: not a repository, an unknown revision, uncommitted changes,
+    /// or no git to ask.
+    #[error("cannot pin {path}: {reason}")]
+    Pin { path: PathBuf, reason: String },
+
     /// Declared in milestone 1, implemented in milestone 2.
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),

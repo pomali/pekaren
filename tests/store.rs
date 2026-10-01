@@ -118,7 +118,7 @@ fn opens_a_store_written_by_an_older_schema() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("store.db");
 
-    // Build a v1 store by hand: strip everything v2 and v3 added.
+    // Build a v1 store by hand: strip everything v2, v3 and v4 added.
     {
         let q = Queue::options()
             .work_on_submit(false)
@@ -131,6 +131,9 @@ fn opens_a_store_written_by_an_older_schema() {
         conn.execute_batch(
             "ALTER TABLE jobs DROP COLUMN script_path;
              ALTER TABLE jobs DROP COLUMN task_name;
+             ALTER TABLE jobs DROP COLUMN pin_repo;
+             ALTER TABLE jobs DROP COLUMN pin_commit;
+             ALTER TABLE jobs DROP COLUMN pin_dir;
              DROP TABLE task_args;
              DROP TABLE job_inputs;
              DROP TABLE job_events;
@@ -139,7 +142,7 @@ fn opens_a_store_written_by_an_older_schema() {
         .unwrap();
     }
 
-    // Reopening runs both migrations in order, old rows intact.
+    // Reopening runs every migration in order, old rows intact.
     let q = Queue::options()
         .work_on_submit(false)
         .open(dir.path())
@@ -150,6 +153,16 @@ fn opens_a_store_written_by_an_older_schema() {
     // v3: the script is a watched input, hashed at submit.
     assert!(q.check_inputs(id).unwrap().is_empty());
     assert!(q.events(id).unwrap().is_empty());
+    // v4: the pin columns exist, and the runnable view sees them, which
+    // the claim query needs.
+    assert!(q.status(id).unwrap().pin.is_none());
+    let old = q.list(Filter::All).unwrap()[0].id;
+    let claimed = pekaren::Worker::new(&q)
+        .poll_interval(Duration::from_millis(10))
+        .run_one()
+        .unwrap();
+    assert_eq!(claimed, Some(old));
+    assert_eq!(q.status(old).unwrap().state, State::Done);
 
     let conn = rusqlite::Connection::open(&db).unwrap();
     let version: i32 = conn

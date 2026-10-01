@@ -1,11 +1,12 @@
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{Error, Result};
 use crate::id::JobId;
+use crate::pin::Pinned;
 use crate::profile::Sample;
 use crate::queue::Queue;
 use crate::store::{Claim, Outcome, WakeClaim};
@@ -229,7 +230,7 @@ impl<'q> Worker<'q> {
     }
 
     /// Everything between holding a lease and having committed an outcome.
-    fn run_claim(&mut self, claim: Claim) -> Result<Committed> {
+    fn run_claim(&mut self, mut claim: Claim) -> Result<Committed> {
         // Before anything expensive: is the job still the job that was
         // submitted? A binary rebuilt since is different code, and running
         // it under the old evaluation prompt is worse than not running it.
@@ -245,6 +246,34 @@ impl<'q> Worker<'q> {
             } else {
                 Committed::LostRace
             });
+        }
+
+        // A pinned job runs in a checkout of its commit, which has to be
+        // brought there first. Its lane is this job's alone while it runs.
+        if let Some(pinned) = claim.pin.clone() {
+            match self.check_out(&claim, &pinned)? {
+                Ok(dir) => {
+                    let cmd = &mut claim.command;
+                    cmd.cwd = Some(dir);
+                    cmd.env
+                        .push(("PEKAREN_PIN_COMMIT".into(), pinned.commit.clone()));
+                    cmd.env.push((
+                        "PEKAREN_PIN_REPO".into(),
+                        pinned.repo.to_string_lossy().into_owned(),
+                    ));
+                }
+                Err(note) => {
+                    let committed =
+                        self.queue
+                            .store()
+                            .commit(&claim, Outcome::Failed, None, Some(&note))?;
+                    return Ok(if committed {
+                        Committed::Failed
+                    } else {
+                        Committed::LostRace
+                    });
+                }
+            }
         }
 
         let mut child = match self.spawn(&claim) {
@@ -307,13 +336,114 @@ impl<'q> Worker<'q> {
         })
     }
 
+    /// Bring a pinned job's lane to its commit, keeping the lease alive
+    /// while git works: a first clone of a big repository takes a while.
+    /// Git's own output goes to the top of the attempt's stderr log.
+    ///
+    /// Returns the directory to run the job in, or why there is none.
+    fn check_out(
+        &self,
+        claim: &Claim,
+        pinned: &Pinned,
+    ) -> Result<std::result::Result<PathBuf, String>> {
+        let store = self.queue.store();
+        let lane = store.lane_dir(&pinned.repo);
+        let logs = store.log_dir(claim.id);
+        std::fs::create_dir_all(&logs).map_err(|e| Error::io(&logs, e))?;
+        if let Some(lanes) = lane.parent() {
+            std::fs::create_dir_all(lanes).map_err(|e| Error::io(lanes, e))?;
+        }
+        let err = logs.join(format!("{}.err", claim.attempt));
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&err)
+            .map_err(|e| Error::io(&err, e))?;
+
+        let quietly = |cmd: &mut std::process::Command| {
+            cmd.stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        for mut step in crate::pin::checkout_steps(pinned, &lane, quietly) {
+            let (out, errs) = match (log.try_clone(), log.try_clone()) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(e), _) | (_, Err(e)) => return Err(Error::io(&err, e)),
+            };
+            step.stdin(Stdio::null())
+                .stdout(Stdio::from(out))
+                .stderr(Stdio::from(errs));
+            if let Err(why) = self.run_step(claim, &mut step)? {
+                let tail = stderr_tail(&err, 300);
+                return Ok(Err(format!(
+                    "checking out {} failed ({why}){}",
+                    pinned.commit,
+                    if tail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {tail}")
+                    }
+                )));
+            }
+        }
+        Ok(Ok(lane.join(&pinned.dir)))
+    }
+
+    /// Run a step that prepares a job as a child of its own, renewing the
+    /// lease while it runs. The error says why it did not succeed: it
+    /// failed, could not start, or was stopped because the lease was lost.
+    fn run_step(
+        &self,
+        claim: &Claim,
+        step: &mut std::process::Command,
+    ) -> Result<std::result::Result<(), String>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            step.process_group(0);
+        }
+        let program = step.get_program().to_string_lossy().into_owned();
+        let mut child = match step.spawn() {
+            Ok(child) => child,
+            Err(e) => return Ok(Err(format!("{program} did not start: {e}"))),
+        };
+        let mut last_renew = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().map_err(|e| Error::io(Path::new("."), e))? {
+                return Ok(if status.success() {
+                    Ok(())
+                } else {
+                    Err(match status.code() {
+                        Some(code) => format!("{program} exited {code}"),
+                        None => format!("{program} was killed"),
+                    })
+                });
+            }
+            if last_renew.elapsed() >= self.lease / 3 {
+                if !self.queue.store().renew(claim, self.lease)? {
+                    kill_group(&mut child);
+                    let _ = child.wait();
+                    return Ok(Err("the lease was lost".into()));
+                }
+                last_renew = Instant::now();
+            }
+            std::thread::sleep(self.poll);
+        }
+    }
+
     fn spawn(&self, claim: &Claim) -> Result<Child> {
         let logs = self.queue.store().log_dir(claim.id);
         std::fs::create_dir_all(&logs).map_err(|e| Error::io(&logs, e))?;
         std::fs::create_dir_all(&claim.scratch).map_err(|e| Error::io(&claim.scratch, e))?;
         let out = std::fs::File::create(logs.join(format!("{}.out", claim.attempt)))
             .map_err(|e| Error::io(&logs, e))?;
-        let err = std::fs::File::create(logs.join(format!("{}.err", claim.attempt)))
+        // Appended to, not truncated: preparing a pinned checkout may have
+        // written to it already.
+        let err = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(logs.join(format!("{}.err", claim.attempt)))
             .map_err(|e| Error::io(&logs, e))?;
 
         let cmd = &claim.command;

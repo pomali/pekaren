@@ -86,6 +86,8 @@ pub struct JobStatus {
     pub deps: Vec<JobId>,
     /// What the latest finished attempt actually cost.
     pub profile: Option<Profile>,
+    /// The commit the job runs a checkout of, when it was pinned to one.
+    pub pin: Option<crate::pin::Pinned>,
 }
 
 /// Which jobs [`Queue::list`] returns.

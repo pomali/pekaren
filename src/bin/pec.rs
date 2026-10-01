@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pekaren::{
-    Command, FailurePolicy, Filter, Job, JobId, JobStatus, KillAfter, OnChange, Queue,
+    Command, FailurePolicy, Filter, Job, JobId, JobStatus, KillAfter, OnChange, Pin, Queue,
     QueueOptions, State, default_store_path,
 };
 
@@ -61,6 +61,16 @@ program and its arguments instead, with no shell. Options:
     --idempotent        safe to run again after a lost lease
     --on-done <command> a shell line to spawn once it settles
     --exec              no shell: the first word is the program
+    --pin [<rev>]       run in a checkout of this commit (default HEAD) of
+                        the repository it runs in, not in the working tree
+    --allow-dirty       pin HEAD even with uncommitted changes to tracked
+                        files, which the job will not see
+
+a pinned job runs in a checkout under the store (a lane, one per
+repository, reused), in the same directory within the tree, and sees
+PEKAREN_PIN_COMMIT and PEKAREN_PIN_REPO. $PEKAREN_GIT names the git that
+reads the repository at submit time: git.exe for a Windows-side worktree
+under WSL.
 
 an --on-done line (on a job or a barrier) is spawned once, by whichever
 worker sees the node settle, in the directory pec was called from, with
@@ -412,6 +422,8 @@ fn parse_submit(words: Vec<String>) -> Result<Job> {
     let mut retries = None;
     let mut idempotent = false;
     let mut on_done = None;
+    let mut pin = None;
+    let mut allow_dirty = false;
 
     let mut flags = words[..split].iter();
     while let Some(flag) = flags.next() {
@@ -455,8 +467,23 @@ fn parse_submit(words: Vec<String>) -> Result<Job> {
             "--eval" => eval = Some(value()?.to_string()),
             "--retries" => retries = Some(number(flag, value()?)?),
             "--on-done" => on_done = Some(value()?.to_string()),
+            // The revision is optional: `--pin` alone is HEAD.
+            "--pin" => {
+                let rev = match flags.as_slice().first() {
+                    Some(next) if !next.starts_with('-') => flags.next(),
+                    _ => None,
+                };
+                pin = Some(match rev {
+                    Some(rev) => Pin::rev(rev),
+                    None => Pin::head(),
+                });
+            }
+            "--allow-dirty" => allow_dirty = true,
             other => return usage(format!("submit does not take {other}")),
         }
+    }
+    if allow_dirty && pin.is_none() {
+        return usage("--allow-dirty only means something with --pin");
     }
 
     let mut cmd = if exec {
@@ -508,6 +535,9 @@ fn parse_submit(words: Vec<String>) -> Result<Job> {
     }
     if let Some(line) = on_done {
         job = job.on_done(wake(&line)?);
+    }
+    if let Some(pin) = pin {
+        job = job.pin(if allow_dirty { pin.allow_dirty() } else { pin });
     }
     Ok(job)
 }
@@ -741,6 +771,13 @@ fn print_detail(q: &Queue, s: &JobStatus) -> Result<()> {
             row("cwd", &dir.display().to_string());
         }
     }
+    if let Some(pin) = &s.pin {
+        let mut at = format!("{} of {}", pin.commit, pin.repo.display());
+        if !pin.dir.as_os_str().is_empty() {
+            let _ = write!(at, ", in {}", pin.dir.display());
+        }
+        row("pinned", &at);
+    }
     if let Some(task) = &s.task {
         row("task", task);
     }
@@ -837,6 +874,14 @@ fn status_json(q: &Queue, s: &JobStatus) -> Result<String> {
             .done(),
         None => "null".into(),
     };
+    let pin = match &s.pin {
+        Some(p) => Json::obj()
+            .str("repo", &p.repo.display().to_string())
+            .str("commit", &p.commit)
+            .str("dir", &p.dir.display().to_string())
+            .done(),
+        None => "null".into(),
+    };
     let logs = if s.is_barrier {
         "null".into()
     } else {
@@ -888,6 +933,7 @@ fn status_json(q: &Queue, s: &JobStatus) -> Result<String> {
                 .map(|p| p.display().to_string())
                 .as_deref(),
         )
+        .raw("pin", pin)
         .raw("logs", logs)
         .opt_str("eval_prompt", s.eval_prompt.as_deref())
         .raw("profile", profile)
