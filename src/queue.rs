@@ -537,9 +537,62 @@ impl Queue {
             }
         }
         self.store.settle()?;
+        for (id, recovered) in self.handoff()? {
+            if recovered {
+                report.wakes_recovered.push(id);
+            }
+        }
         Ok(report)
     }
+
+    /// Spawn the wake command of every node that has settled and not had it
+    /// spawned yet: the handoff. Of all the processes that sweep the store,
+    /// exactly one spawns each wake, and one whose claimant died before
+    /// spawning it is picked up here. Workers call this whenever something
+    /// may have settled; [`reap`](Queue::reap) calls it too.
+    ///
+    /// Returns the nodes whose wake this call spawned, each marked when it
+    /// was a claim someone else had left unfulfilled.
+    pub(crate) fn handoff(&self) -> Result<Vec<(JobId, bool)>> {
+        let who = format!("{}-{}", crate::worker::hostname(), std::process::id());
+        let mut spawned = Vec::new();
+        for claim in self.store.claim_wakes(&who, WAKE_STALE)? {
+            let logs = self.store.log_dir(claim.job);
+            match crate::worker::spawn_wake(self.path(), &logs, &claim) {
+                Ok(pid) => {
+                    self.store.fulfil_wake(&claim, Some(pid))?;
+                    let note = if claim.recovered {
+                        " (recovered from a claim nobody fulfilled)"
+                    } else {
+                        ""
+                    };
+                    self.store.record_event(
+                        claim.job,
+                        "info",
+                        &format!("wake spawned, pid {pid}{note}"),
+                    )?;
+                    spawned.push((claim.job, claim.recovered));
+                }
+                // A wake that cannot start will not start next time
+                // either; say so once instead of retrying for ever.
+                Err(e) => {
+                    self.store.fulfil_wake(&claim, None)?;
+                    self.store.record_event(
+                        claim.job,
+                        "error",
+                        &format!("wake did not spawn: {e}"),
+                    )?;
+                }
+            }
+        }
+        Ok(spawned)
+    }
 }
+
+/// How long a notification claim may stay unfulfilled before another
+/// process decides its claimant died and spawns the wake itself. A spawn
+/// takes milliseconds; this only has to outlast a stalled disk.
+const WAKE_STALE: Duration = Duration::from_secs(60);
 
 /// Where the default store lives: `$PEKAREN_STORE` when set, otherwise
 /// `~/.pekaren`. Resolved on every call, so a script that sets the variable

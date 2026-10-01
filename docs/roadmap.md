@@ -27,8 +27,9 @@ that has not started), and reclaiming a lease left by another host.
 - Jobs stranded by a failed or cancelled dependency are cancelled, so a
   wait on them returns (done).
 - The notification claim: finishing workers race, one wins, an unfulfilled
-  claim is picked up by the next process to touch the store.
-- Spawning the stored wake command, `ByWarmth` included.
+  claim is picked up by the next process to touch the store (done: a claim
+  older than a minute is taken over by the next worker or `reap`).
+- Spawning the stored wake command, `ByWarmth` included (done).
 - A `sessions` table and a `SessionStart` hook, so a wake can reach the
   session that submitted the work: see
   [`notes/waking-claude-code.md`](notes/waking-claude-code.md).

@@ -60,6 +60,11 @@ program and its arguments instead, with no shell. Options:
     --on-done <command> a shell line to spawn once it settles
     --exec              no shell: the first word is the program
 
+an --on-done line (on a job or a barrier) is spawned once, by whichever
+worker sees the node settle, in the directory pec was called from, with
+PEKAREN_JOB, PEKAREN_STATE and PEKAREN_EVAL_PROMPT set; its output goes to
+logs/<n>/wake.out and wake.err in the store.
+
 status shows every job, one line each, or one job in full; --json prints
 one JSON object per job instead. logs prints the latest attempt's stdout,
 or its stderr with --err, or with --path only where it is. cancel stops
@@ -453,9 +458,15 @@ fn parse_submit(words: Vec<String>) -> Result<Job> {
         job = job.idempotent(true);
     }
     if let Some(line) = on_done {
-        job = job.on_done(line);
+        job = job.on_done(wake(&line)?);
     }
     Ok(job)
+}
+
+/// A wake command from a shell: a shell line, run where it was submitted,
+/// like the job itself.
+fn wake(line: &str) -> Result<Command> {
+    Ok(Command::line(line).cwd(absolute(".")?))
 }
 
 /// `pec barrier --after <ids> [...]`, as the barrier it describes.
@@ -472,7 +483,7 @@ fn parse_barrier(words: Vec<String>) -> Result<Job> {
             "--after" => after.extend(parse_ids(value()?)?),
             "--name" => job = job.name(value()?),
             "--eval" => job = job.eval_prompt(value()?),
-            "--on-done" => job = job.on_done(value()?),
+            "--on-done" => job = job.on_done(wake(value()?)?),
             "--fail-at-end" => job = job.policy(FailurePolicy::FailAtEnd),
             other => return usage(format!("barrier does not take {other}")),
         }

@@ -105,7 +105,11 @@ crashes mid-handoff, the claim stays unfulfilled and the next process to
 touch the store picks it up.
 
 **What gets spawned** is a command stored on the barrier. The library does
-not interpret it.
+not interpret it. It runs detached, in its own process group, and learns
+what settled from `PEKAREN_JOB`, `PEKAREN_STATE` and `PEKAREN_EVAL_PROMPT`;
+its output lands next to the node's logs. A `ByWarmth` pair is decided by
+when the node settled, not by when a worker noticed. A command that cannot
+start is recorded as an error on the node, once, and not retried.
 
 | Situation | Action |
 | --- | --- |

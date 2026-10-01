@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::id::JobId;
 use crate::profile::Sample;
 use crate::queue::Queue;
-use crate::store::{Claim, Outcome};
+use crate::store::{Claim, Outcome, WakeClaim};
 
 /// What one host has to offer. Read once as a worker starts and written to
 /// the store, so a single-machine store has exactly one row and a later
@@ -108,7 +108,7 @@ impl<'q> Worker<'q> {
     /// Claim and run one job if anything is claimable right now. Returns
     /// `None` when nothing is.
     pub fn run_one(&mut self) -> Result<Option<JobId>> {
-        self.queue.store().settle()?;
+        self.settle()?;
         let Some(claim) = self
             .queue
             .store()
@@ -118,7 +118,7 @@ impl<'q> Worker<'q> {
         };
         let id = claim.id;
         self.run_claim(claim)?;
-        self.queue.store().settle()?;
+        self.settle()?;
         Ok(Some(id))
     }
 
@@ -157,7 +157,7 @@ impl<'q> Worker<'q> {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 break;
             }
-            self.queue.store().settle()?;
+            self.settle()?;
 
             match self
                 .queue
@@ -171,13 +171,21 @@ impl<'q> Worker<'q> {
                         Committed::Failed => report.failed.push(id),
                         Committed::LostRace => report.lost_races += 1,
                     }
-                    self.queue.store().settle()?;
+                    self.settle()?;
                 }
                 None if stop_when_idle => break,
                 None => std::thread::sleep(self.poll),
             }
         }
         Ok(report)
+    }
+
+    /// Settle what can be settled, then hand off: whatever finished, the
+    /// process that noticed spawns what comes next.
+    fn settle(&self) -> Result<()> {
+        self.queue.store().settle()?;
+        self.queue.handoff()?;
+        Ok(())
     }
 
     /// Everything between holding a lease and having committed an outcome.
@@ -269,21 +277,7 @@ impl<'q> Worker<'q> {
             .map_err(|e| Error::io(&logs, e))?;
 
         let cmd = &claim.command;
-        let mut process = if cmd.shell {
-            let mut p = std::process::Command::new("sh");
-            p.arg("-c").arg(&cmd.program);
-            p
-        } else {
-            let mut p = std::process::Command::new(&cmd.program);
-            p.args(&cmd.args);
-            p
-        };
-        if let Some(dir) = &cmd.cwd {
-            process.current_dir(dir);
-        }
-        for (key, value) in &cmd.env {
-            process.env(key, value);
-        }
+        let mut process = process_for(cmd);
         process
             .env(crate::task::JOB_ENV, claim.id.to_string())
             .env("PEKAREN_STORE", self.queue.path())
@@ -302,13 +296,6 @@ impl<'q> Worker<'q> {
             .stdin(Stdio::null())
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err));
-        // Its own process group, so a kill reaches what a shell line or a
-        // bash script started under it (python, cargo), not just `sh`.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            process.process_group(0);
-        }
 
         process
             .spawn()
@@ -390,6 +377,67 @@ impl<'q> Worker<'q> {
         std::fs::rename(&claim.scratch, &dest).map_err(|e| Error::io(&dest, e))?;
         Ok(())
     }
+}
+
+/// The process a stored command describes, before anything job-specific is
+/// added to its environment.
+fn process_for(cmd: &crate::job::Command) -> std::process::Command {
+    let mut process = if cmd.shell {
+        let mut p = std::process::Command::new("sh");
+        p.arg("-c").arg(&cmd.program);
+        p
+    } else {
+        let mut p = std::process::Command::new(&cmd.program);
+        p.args(&cmd.args);
+        p
+    };
+    if let Some(dir) = &cmd.cwd {
+        process.current_dir(dir);
+    }
+    for (key, value) in &cmd.env {
+        process.env(key, value);
+    }
+    // Its own process group, so a kill reaches what a shell line or a
+    // bash script started under it (python, cargo), not just `sh`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.process_group(0);
+    }
+    process
+}
+
+/// Start the wake command a node settled into, and leave it running.
+///
+/// It gets its own process group, so stopping the worker does not stop
+/// it, and writes to `wake.out` / `wake.err` in the node's log directory.
+/// It learns what settled from `PEKAREN_JOB`, `PEKAREN_STATE` and
+/// `PEKAREN_EVAL_PROMPT`. A thread waits on it, so a worker that stays up
+/// for days does not collect zombies.
+pub(crate) fn spawn_wake(store: &Path, logs: &Path, claim: &WakeClaim) -> Result<u32> {
+    std::fs::create_dir_all(logs).map_err(|e| Error::io(logs, e))?;
+    let out = std::fs::File::create(logs.join("wake.out")).map_err(|e| Error::io(logs, e))?;
+    let err = std::fs::File::create(logs.join("wake.err")).map_err(|e| Error::io(logs, e))?;
+
+    let mut process = process_for(&claim.command);
+    process
+        .env(crate::task::JOB_ENV, claim.job.to_string())
+        .env("PEKAREN_STATE", claim.state.to_string())
+        .env("PEKAREN_STORE", store)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err));
+    if let Some(prompt) = &claim.eval_prompt {
+        process.env("PEKAREN_EVAL_PROMPT", prompt);
+    }
+    let mut child = process
+        .spawn()
+        .map_err(|e| Error::io(Path::new(&claim.command.program), e))?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
 }
 
 /// Kill the child and everything in its process group.

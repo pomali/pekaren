@@ -153,6 +153,38 @@ fn submit_can_skip_the_shell_refuse_changed_code_and_retry() {
 }
 
 #[test]
+fn a_wake_from_the_shell_runs_where_it_was_submitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let here = dir.path().join("here");
+    std::fs::create_dir(&here).unwrap();
+
+    let a = submitted(pec(&store, &["submit", "--", "true"]));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pec"))
+        .arg("--store")
+        .arg(&store)
+        .current_dir(&here)
+        .args(["barrier", "--after", &a.to_string()])
+        .args(["--on-done", "echo $PEKAREN_JOB $PEKAREN_STATE > woke"])
+        .output()
+        .unwrap();
+    let barrier = submitted(out);
+
+    let q = queue(&store);
+    worker(&q).run_until_idle().unwrap();
+    let woke = here.join("woke");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !woke.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        std::fs::read_to_string(&woke).unwrap().trim(),
+        format!("{barrier} done")
+    );
+}
+
+#[test]
 fn barrier_cancel_and_the_mistakes_pec_refuses() {
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("store");

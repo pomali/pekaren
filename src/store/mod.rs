@@ -916,6 +916,116 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Claim every wake that is due, for `who` to spawn: its node has
+    /// settled, and either nobody has claimed it or the claim is older than
+    /// `stale` and was never fulfilled — its winner died mid-handoff.
+    ///
+    /// This is the notification claim: one write transaction, so of any
+    /// number of processes sweeping at once exactly one gets each wake.
+    /// A `ByWarmth` pair is decided here by when the node settled, not by
+    /// when someone noticed; the branch not taken is marked fulfilled with
+    /// no process, so it is never considered again.
+    pub(crate) fn claim_wakes(&self, who: &str, stale: Duration) -> Result<Vec<WakeClaim>> {
+        let tx = self.write_tx()?;
+        let now = now_ms();
+        let cutoff = now - stale.as_millis() as i64;
+
+        /// The columns a claim needs off a wake and its node.
+        struct Due {
+            wake: i64,
+            job: JobId,
+            trigger: String,
+            warm_until: Option<i64>,
+            shell: bool,
+            program: String,
+            cwd: Option<String>,
+            reclaimed: bool,
+            state: String,
+            eval_prompt: Option<String>,
+            finished_at: Option<i64>,
+        }
+
+        let mut stmt = tx.prepare(
+            "SELECT w.id, w.job_id, w.trigger, w.warm_until, w.shell, w.program, w.cwd,
+                    w.claimed_by IS NOT NULL, j.state, j.eval_prompt, j.finished_at
+             FROM wakes w JOIN jobs j ON j.id = w.job_id
+             WHERE j.state IN ('done', 'failed', 'cancelled')
+               AND w.fulfilled_at IS NULL
+               AND (w.claimed_by IS NULL OR w.claimed_at < ?1)
+             ORDER BY w.id",
+        )?;
+        let due = stmt
+            .query_map([cutoff], |r| {
+                Ok(Due {
+                    wake: r.get(0)?,
+                    job: JobId::new(r.get(1)?),
+                    trigger: r.get(2)?,
+                    warm_until: r.get(3)?,
+                    shell: r.get::<_, i64>(4)? != 0,
+                    program: r.get(5)?,
+                    cwd: r.get(6)?,
+                    reclaimed: r.get(7)?,
+                    state: r.get(8)?,
+                    eval_prompt: r.get(9)?,
+                    finished_at: r.get(10)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut claims = Vec::new();
+        for d in due {
+            let settled_at = d.finished_at.unwrap_or(now);
+            let taken = match (d.trigger.as_str(), d.warm_until) {
+                ("warm", Some(until)) => settled_at < until,
+                ("cold", Some(until)) => settled_at >= until,
+                _ => true,
+            };
+            let changed = tx.execute(
+                "UPDATE wakes SET claimed_by = ?2, claimed_at = ?3,
+                     fulfilled_at = CASE WHEN ?4 THEN NULL ELSE ?3 END
+                 WHERE id = ?1 AND fulfilled_at IS NULL
+                   AND (claimed_by IS NULL OR claimed_at < ?5)",
+                params![d.wake, who, now, taken, cutoff],
+            )?;
+            if changed == 0 || !taken {
+                continue;
+            }
+            let mut stmt =
+                tx.prepare_cached("SELECT arg FROM wake_args WHERE wake_id = ?1 ORDER BY pos")?;
+            let args = stmt
+                .query_map([d.wake], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            claims.push(WakeClaim {
+                wake: d.wake,
+                job: d.job,
+                state: State::from_db(&d.state),
+                eval_prompt: d.eval_prompt,
+                recovered: d.reclaimed,
+                command: Command {
+                    program: d.program,
+                    args,
+                    shell: d.shell,
+                    cwd: d.cwd.map(PathBuf::from),
+                    env: Vec::new(),
+                },
+            });
+        }
+
+        tx.commit()?;
+        Ok(claims)
+    }
+
+    /// The claimed wake has been spawned, or could not be and will not be
+    /// tried again.
+    pub(crate) fn fulfil_wake(&self, claim: &WakeClaim, pid: Option<u32>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE wakes SET fulfilled_at = ?2, spawn_pid = ?3 WHERE id = ?1",
+            params![claim.wake, now_ms(), pid.map(i64::from)],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn record_samples(
         &self,
         claim: &Claim,
@@ -962,6 +1072,18 @@ pub(crate) enum Outcome {
     Failed,
     Killed,
     Cancelled,
+}
+
+/// A wake command this process has won the right to spawn.
+pub(crate) struct WakeClaim {
+    pub wake: i64,
+    /// The node that settled.
+    pub job: JobId,
+    pub state: State,
+    pub eval_prompt: Option<String>,
+    pub command: Command,
+    /// Someone claimed it before and never spawned it.
+    pub recovered: bool,
 }
 
 /// A child that may still be running with nobody supervising it.

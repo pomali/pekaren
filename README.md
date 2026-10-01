@@ -30,8 +30,13 @@ than left pending, failed leases are reclaimed, `wait` waits.
 - change detection on everything a job depends on
 - decisions written down in [`docs/adr/`](docs/adr/)
 
-Not built yet: the handoff — spawning the wake command when a barrier
-settles — and GPU utilisation in the profile `pec status` shows. See
+When a node with an `on_done` command settles, the worker that noticed
+spawns it — exactly once, however many workers share the store — with
+`PEKAREN_JOB`, `PEKAREN_STATE` and `PEKAREN_EVAL_PROMPT` set, and its
+output in `logs/<n>/wake.{out,err}`.
+
+Not built yet: GPU utilisation in the profile `pec status` shows, and a
+wake that knows whether its session is still alive. See
 [`docs/roadmap.md`](docs/roadmap.md).
 
 With no daemon, someone has to be the worker. Either the submitting process
@@ -65,7 +70,7 @@ T=$(pec submit --name train --gpus 1 --cpus 24 --est 40m --cap 90m \
       --env LR=3e-4 --watch data/train --eval "Loss should drop below 0.3" \
       -- python train.py --lr '$LR')
 V=$(pec submit --name eval --after $T --cpus 4 -- python eval.py)
-W=$(pec barrier --after $T,$V --on-done 'notify-send "sweep settled"')
+W=$(pec barrier --after $T,$V --on-done 'pec status --json $PEKAREN_JOB > sweep.done')
 pec wait --timeout 1h $W; echo $?     # 0, 1 or 124
 pec logs $T                           # its stdout; --err for stderr
 ```
