@@ -54,7 +54,9 @@ pec status        # one line per job; `pec status j3` for one in full
 A worker runs one job at a time; for more at once, start more workers.
 They share the host's CPUs and GPUs through the store, each claiming only
 what the live leases leave free, and `--cpus` / `--gpus 0,1` narrow what a
-worker believes the host has. A long-lived worker is still not a daemon:
+worker believes the host has. A worker takes the oldest job that fits what
+is free, so small jobs can overtake a big one; `--fifo` makes it wait for
+the oldest instead. A long-lived worker is still not a daemon:
 nothing needs it, and a store with none simply waits.
 
 `pec wait` answers in its exit code: 0 when every job is done, 1 when any

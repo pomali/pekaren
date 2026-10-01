@@ -575,11 +575,16 @@ impl Store {
     /// transaction: read the pool, pick a slice, write the lease. Losing
     /// the race to another process means the update matches nothing, and
     /// the next call tries again.
+    ///
+    /// With `strict_fifo`, take the oldest runnable job this worker could
+    /// run at all, or nothing: when it does not fit what is free, wait for
+    /// it rather than let a younger, smaller job past.
     pub(crate) fn claim_next(
         &self,
         host: &str,
         capacity: &crate::worker::Capacity,
         lease: Duration,
+        strict_fifo: bool,
     ) -> Result<Option<Claim>> {
         let tx = self.write_tx()?;
         let now = now_ms();
@@ -615,27 +620,50 @@ impl Store {
             gpus: i64,
             kill_after_secs: Option<i64>,
             task: Option<String>,
+            fits: bool,
         }
 
+        // Which jobs are this worker's to consider: those that fit what is
+        // free now or, strictly first come first served, those that would
+        // fit it at all. A job bigger than the whole worker is some other
+        // worker's to wait for, not this one's.
+        let limits = if strict_fifo {
+            (
+                capacity.cpus as i64,
+                capacity.mem_mb as i64,
+                capacity.gpus.len() as i64,
+            )
+        } else {
+            (free_cpus, free_mem, free_gpus.len() as i64)
+        };
         let candidate: Option<Candidate> = tx
             .query_row(
-                "SELECT id, gpus, kill_after_secs, task_name
+                "SELECT id, gpus, kill_after_secs, task_name,
+                        cpus <= ?4 AND mem_mb <= ?5 AND gpus <= ?6
                  FROM runnable
                  WHERE kind = 'command'
                    AND cpus <= ?1 AND mem_mb <= ?2 AND gpus <= ?3
                  ORDER BY id LIMIT 1",
-                params![free_cpus, free_mem, free_gpus.len() as i64],
+                params![
+                    limits.0,
+                    limits.1,
+                    limits.2,
+                    free_cpus,
+                    free_mem,
+                    free_gpus.len() as i64
+                ],
                 |r| {
                     Ok(Candidate {
                         id: r.get(0)?,
                         gpus: r.get(1)?,
                         kill_after_secs: r.get(2)?,
                         task: r.get(3)?,
+                        fits: r.get(4)?,
                     })
                 },
             )
             .optional()?;
-        let Some(candidate) = candidate else {
+        let Some(candidate) = candidate.filter(|c| c.fits) else {
             return Ok(None);
         };
         let id = JobId::new(candidate.id);

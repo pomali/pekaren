@@ -28,7 +28,7 @@ usage:
     pec [--store <dir>] barrier --after <ids> [--name <n>] [--eval <text>]
                                 [--on-done <command>] [--fail-at-end]
     pec [--store <dir>] work [--once | --forever [--idle <duration>]]
-                             [--cpus <n>] [--gpus <0,1|none>]
+                             [--cpus <n>] [--gpus <0,1|none>] [--fifo]
     pec [--store <dir>] status [--json] [<job-id>...]
     pec [--store <dir>] wait [--timeout <secs>] [--json] <job-id>...
     pec [--store <dir>] logs [--err] [--path] <job-id>
@@ -74,6 +74,10 @@ finishes the job it is running and exits; a second signal stops it at
 once. Run several for concurrency: they share the host's CPUs and GPUs
 through the store. --cpus and --gpus override what the host appears to
 have (GPUs default to $PEKAREN_GPUS, else $CUDA_VISIBLE_DEVICES).
+A worker takes the oldest job that fits what is free; with --fifo it takes
+jobs strictly in order, waiting for the oldest one it could run rather
+than let smaller ones past, so a big job is not starved. Give every worker
+on a store the same --fifo.
 
 status shows every job, one line each, or one job in full; --json prints
 one JSON object per job instead. logs prints the latest attempt's stdout,
@@ -262,7 +266,7 @@ fn run() -> Result<ExitCode> {
         // With no daemon, this is how work gets done when the script
         // that submitted it has gone: a worker anyone can start.
         "work" => {
-            let (mut once, mut forever) = (false, false);
+            let (mut once, mut forever, mut fifo) = (false, false, false);
             let mut idle = Duration::from_secs(1);
             let mut capacity = pekaren::Capacity::detect()?;
             while let Some(flag) = args.next() {
@@ -273,6 +277,7 @@ fn run() -> Result<ExitCode> {
                 match flag.as_str() {
                     "--once" => once = true,
                     "--forever" => forever = true,
+                    "--fifo" => fifo = true,
                     "--idle" => idle = parse_duration(&value()?)?,
                     "--cpus" => capacity.cpus = number(&flag, &value()?)?,
                     "--gpus" => capacity.gpus = parse_devices(&value()?)?,
@@ -280,7 +285,9 @@ fn run() -> Result<ExitCode> {
                 }
             }
             let q = open()?;
-            let mut worker = pekaren::Worker::new(&q).capacity(capacity.clone());
+            let mut worker = pekaren::Worker::new(&q)
+                .capacity(capacity.clone())
+                .strict_fifo(fifo);
             let report = if once {
                 worker.run_one()?;
                 Default::default()

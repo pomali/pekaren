@@ -184,9 +184,14 @@ devices and refers to them as device 0 onward.
 Linux-specific and fiddly. Declared memory prevents obvious overcommit, such
 as two 40 GB jobs on a 64 GB box.
 
-**Starvation (parked).** Small jobs can keep slipping past a large one. The
-planned fix: once a job has waited past a threshold, it reserves capacity
-rather than asking for it, and smaller jobs stop jumping the queue.
+**Starvation.** Small jobs can keep slipping past a large one, since a
+worker takes the oldest job that fits what is free. The opt-in answer so
+far is a strict FIFO worker (`Worker::strict_fifo`, `pec work --fifo`): it
+waits for the oldest runnable job it could run at all and claims nothing
+until that fits, at the price of leaving capacity idle while it waits.
+Still planned: once a job has waited past a threshold, it reserves
+capacity rather than asking for it, so smaller jobs can go on running
+beside the reservation but not in it.
 
 ## Profiling and estimates
 

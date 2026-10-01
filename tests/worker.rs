@@ -171,6 +171,39 @@ fn cancelling_a_job_cancels_what_depends_on_it() {
 }
 
 #[test]
+fn a_strict_fifo_worker_does_not_let_small_jobs_past_a_big_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = queue(dir.path());
+
+    // Something already holds two of the four cores, in another worker.
+    let hog = q.submit(Job::cmd("sleep 1").cpus(2)).unwrap();
+    let path = dir.path().to_path_buf();
+    let other = std::thread::spawn(move || {
+        let q = queue(&path);
+        worker(&q).run_one().unwrap()
+    });
+    while q.status(hog).unwrap().state != State::Running {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Bigger than any worker here: not this worker's to wait for.
+    let huge = q.submit(Job::cmd("true").cpus(64)).unwrap();
+    let big = q.submit(Job::cmd("true").cpus(4)).unwrap();
+    let small = q.submit(Job::cmd("true").cpus(1)).unwrap();
+
+    // Strict: the big job is next, it does not fit yet, so nothing runs.
+    assert_eq!(worker(&q).strict_fifo(true).run_one().unwrap(), None);
+    assert_eq!(q.status(small).unwrap().state, State::Ready);
+    // The default lets the small one past.
+    assert_eq!(worker(&q).run_one().unwrap(), Some(small));
+
+    // Once the hog is done the big job goes first.
+    assert_eq!(other.join().unwrap(), Some(hog));
+    assert_eq!(worker(&q).strict_fifo(true).run_one().unwrap(), Some(big));
+    assert_eq!(q.status(huge).unwrap().state, State::Ready);
+}
+
+#[test]
 fn a_job_that_will_not_end_is_killed_at_its_cap() {
     let dir = tempfile::tempdir().unwrap();
     let q = queue(dir.path());

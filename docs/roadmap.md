@@ -64,7 +64,8 @@ that has not started), and reclaiming a lease left by another host.
   proves too strict.
 
 - Starvation: a waiting job reserves capacity past some threshold. Needs the
-  threshold, and needs scheduling to exist first.
+  threshold. Strict FIFO claiming, opt-in per worker, covers the simple
+  case today.
 - Multi-node: WAL does not work over network filesystems, so this means a
   tiny optional server, not a shared mount.
 - Cache-warm detection: today `ByWarmth` is a wall-clock deadline. The

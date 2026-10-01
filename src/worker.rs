@@ -67,6 +67,7 @@ pub struct Worker<'q> {
     lease: Duration,
     poll: Duration,
     idle: Option<Duration>,
+    strict_fifo: bool,
     host: String,
 }
 
@@ -82,6 +83,7 @@ impl<'q> Worker<'q> {
             lease: Duration::from_secs(90),
             poll: Duration::from_millis(200),
             idle: None,
+            strict_fifo: false,
             host: hostname(),
         }
     }
@@ -115,15 +117,32 @@ impl<'q> Worker<'q> {
         self
     }
 
+    /// Take jobs strictly in the order they were submitted. Off by
+    /// default: a worker takes the oldest job that fits what is free, so
+    /// a steady stream of small jobs can keep a big one waiting for ever.
+    /// A strict worker waits for the oldest runnable job instead, and
+    /// claims nothing until it fits.
+    ///
+    /// Only jobs this worker could run at all count: one that asks for
+    /// more than its whole capacity is left for a bigger worker rather
+    /// than blocking this one. Every worker on a store should agree on
+    /// this; one that does not still lets small jobs past.
+    pub fn strict_fifo(mut self, yes: bool) -> Self {
+        self.strict_fifo = yes;
+        self
+    }
+
+    fn claim(&self) -> Result<Option<Claim>> {
+        self.queue
+            .store()
+            .claim_next(&self.host, &self.capacity, self.lease, self.strict_fifo)
+    }
+
     /// Claim and run one job if anything is claimable right now. Returns
     /// `None` when nothing is.
     pub fn run_one(&mut self) -> Result<Option<JobId>> {
         self.settle()?;
-        let Some(claim) = self
-            .queue
-            .store()
-            .claim_next(&self.host, &self.capacity, self.lease)?
-        else {
+        let Some(claim) = self.claim()? else {
             return Ok(None);
         };
         let id = claim.id;
@@ -173,11 +192,7 @@ impl<'q> Worker<'q> {
             }
             self.settle()?;
 
-            match self
-                .queue
-                .store()
-                .claim_next(&self.host, &self.capacity, self.lease)?
-            {
+            match self.claim()? {
                 Some(claim) => {
                     let id = claim.id;
                     match self.run_claim(claim)? {
